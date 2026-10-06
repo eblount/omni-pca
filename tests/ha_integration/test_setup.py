@@ -60,7 +60,9 @@ async def test_switch_entities_for_zone_bypass(
     hass: HomeAssistant, configured_panel
 ) -> None:
     """One bypass switch per binary zone."""
-    states = hass.states.async_all("switch")
+    states = [
+        s for s in hass.states.async_all("switch") if s.entity_id.endswith("_bypass")
+    ]
     assert len(states) == 3  # one per binary zone
 
 

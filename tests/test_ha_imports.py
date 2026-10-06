@@ -43,8 +43,12 @@ def test_manifest_matches_library_version() -> None:
     )
     manifest = json.loads(manifest_path.read_text())
     lib_version = version("omni-pca")
-    assert manifest["version"] == lib_version, (
-        f"manifest.json version {manifest['version']!r} != "
+    # An integration-only release keeps the library pin and appends a
+    # fourth component (2026.5.14 -> 2026.5.14.1).
+    assert manifest["version"] == lib_version or manifest["version"].startswith(
+        f"{lib_version}."
+    ), (
+        f"manifest.json version {manifest['version']!r} is not based on "
         f"library version {lib_version!r}"
     )
     assert f"omni-pca=={lib_version}" in manifest["requirements"]

@@ -15,7 +15,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
-from homeassistant.const import ATTR_CONFIG_ENTRY_ID as CONF_ENTRY_ID
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 
@@ -35,6 +34,9 @@ SERVICE_CLEAR_MESSAGE = "clear_message"
 SERVICE_ACKNOWLEDGE_ALERTS = "acknowledge_alerts"
 SERVICE_SEND_COMMAND = "send_command"
 
+# Must match the field name in services.yaml. HA's ATTR_CONFIG_ENTRY_ID is
+# "config_entry_id", which made every service reject the documented field.
+CONF_ENTRY_ID = "entry_id"
 ATTR_ZONE_INDEX = "zone_index"
 ATTR_PROGRAM_INDEX = "program_index"
 ATTR_MESSAGE_INDEX = "message_index"
