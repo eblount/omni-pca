@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -36,6 +38,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from omni_pca.client import ObjectType as ClientObjectType
 from omni_pca.client import OmniClient
+from omni_pca.commands import CommandFailedError
 from omni_pca.connection import (
     ConnectionError as OmniConnectionError,
 )
@@ -81,6 +84,10 @@ from .const import (
     MANUFACTURER,
     MAX_OBJECT_INDEX,
     SCAN_INTERVAL,
+    STATUS_CHUNK_AREAS,
+    STATUS_CHUNK_THERMOSTATS,
+    STATUS_CHUNK_UNITS,
+    STATUS_CHUNK_ZONES,
 )
 
 # --------------------------------------------------------------------------
@@ -282,6 +289,7 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
         zones = await self._discover_zones(client)
         units = await self._discover_units(client)
         areas = await self._discover_areas(client)
+        areas = await self._drop_absent_areas(client, areas)
         thermostats = await self._discover_thermostats(client)
         buttons = await self._discover_buttons(client)
         programs = await self._discover_programs(client)
@@ -362,6 +370,37 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             if isinstance(props, AreaProperties):
                 out[index] = props
         return out
+
+    async def _drop_absent_areas(
+        self, client: OmniClient, areas: dict[int, AreaProperties]
+    ) -> dict[int, AreaProperties]:
+        """Drop areas the panel model doesn't have.
+
+        When no area is named, ``list_area_names`` synthesizes "Area 1"..
+        "Area 8" (the Omni Pro II cap). Smaller panels answer Properties
+        for all eight but NAK Status past their real count — an Omni IIe
+        has two areas — which would leave permanently stateless alarm
+        panels in HA. Keep only the areas that report status; if none do
+        (or the probe fails) leave discovery untouched.
+        """
+        if not areas:
+            return areas
+        try:
+            records = await self._fetch_status_chunked(
+                client.get_object_status,
+                ObjectType.AREA,
+                areas,
+                STATUS_CHUNK_AREAS,
+            )
+        except (OmniConnectionError, RequestTimeoutError):
+            raise
+        except Exception:
+            LOGGER.debug("area presence probe failed", exc_info=True)
+            return areas
+        present = {r.index for r in records if isinstance(r, AreaStatus)}
+        if not present:
+            return areas
+        return {index: props for index, props in areas.items() if index in present}
 
     async def _discover_thermostats(
         self, client: OmniClient
@@ -576,14 +615,70 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
 
     # ---- live polling ----------------------------------------------------
 
+    async def _fetch_status_chunked(
+        self,
+        fetch: Callable[[ObjectType, int, int], Awaitable[Sequence[Any]]],
+        object_type: ObjectType,
+        indices: Iterable[int],
+        chunk: int,
+    ) -> list[Any]:
+        """Fetch status for ``indices`` in windows of at most ``chunk`` objects.
+
+        A real panel can't return an arbitrarily long status reply: an
+        Omni IIe (fw 3.2) answers a 50-zone ExtendedStatus request but
+        goes silent on a 60-zone one, and NAKs larger ranges still. The
+        reply's length field is a single byte, so anything past ~250
+        bytes can't be framed at all. Asking for ``1..max(index)`` in one
+        request therefore times out on any install whose highest named
+        object sits above the limit.
+
+        Windows that hold no discovered object are skipped, and a window
+        the panel NAKs (a range reaching past the model's object count,
+        e.g. areas 3..8 on a two-area panel) is retried one object at a
+        time so the objects that do exist still report.
+        """
+        wanted = sorted(set(indices))
+        out: list[Any] = []
+        pos = 0
+        while pos < len(wanted):
+            start = wanted[pos]
+            limit = start + chunk - 1
+            nxt = pos
+            while nxt < len(wanted) and wanted[nxt] <= limit:
+                nxt += 1
+            end = wanted[nxt - 1]
+            try:
+                out.extend(await fetch(object_type, start, end))
+            except CommandFailedError:
+                if start == end:
+                    LOGGER.debug(
+                        "%s #%d status NAK'd; skipping", object_type.name, start
+                    )
+                else:
+                    for index in wanted[pos:nxt]:
+                        try:
+                            out.extend(await fetch(object_type, index, index))
+                        except CommandFailedError:
+                            LOGGER.debug(
+                                "%s #%d status NAK'd; skipping",
+                                object_type.name,
+                                index,
+                            )
+            pos = nxt
+        return out
+
     async def _poll_zone_status(
         self, client: OmniClient, zones: dict[int, ZoneProperties]
     ) -> dict[int, ZoneStatus]:
         if not zones:
             return {}
-        end = max(zones)
         try:
-            records = await client.get_extended_status(ObjectType.ZONE, 1, end)
+            records = await self._fetch_status_chunked(
+                client.get_extended_status,
+                ObjectType.ZONE,
+                zones,
+                STATUS_CHUNK_ZONES,
+            )
         except (OmniConnectionError, RequestTimeoutError):
             raise
         except Exception:
@@ -600,9 +695,13 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
     ) -> dict[int, UnitStatus]:
         if not units:
             return {}
-        end = max(units)
         try:
-            records = await client.get_extended_status(ObjectType.UNIT, 1, end)
+            records = await self._fetch_status_chunked(
+                client.get_extended_status,
+                ObjectType.UNIT,
+                units,
+                STATUS_CHUNK_UNITS,
+            )
         except (OmniConnectionError, RequestTimeoutError):
             raise
         except Exception:
@@ -619,9 +718,13 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
     ) -> dict[int, AreaStatus]:
         if not areas:
             return {}
-        end = max(areas)
         try:
-            records = await client.get_object_status(ObjectType.AREA, 1, end)
+            records = await self._fetch_status_chunked(
+                client.get_object_status,
+                ObjectType.AREA,
+                areas,
+                STATUS_CHUNK_AREAS,
+            )
         except (OmniConnectionError, RequestTimeoutError):
             raise
         except Exception:
@@ -638,10 +741,12 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
     ) -> dict[int, ThermostatStatus]:
         if not thermostats:
             return {}
-        end = max(thermostats)
         try:
-            records = await client.get_extended_status(
-                ObjectType.THERMOSTAT, 1, end
+            records = await self._fetch_status_chunked(
+                client.get_extended_status,
+                ObjectType.THERMOSTAT,
+                thermostats,
+                STATUS_CHUNK_THERMOSTATS,
             )
         except (OmniConnectionError, RequestTimeoutError):
             raise

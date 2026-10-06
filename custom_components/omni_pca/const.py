@@ -32,6 +32,16 @@ MANUFACTURER: Final = "HAI / Leviton"
 # panel goes quiet.
 SCAN_INTERVAL: Final = timedelta(seconds=30)
 
+# Most objects to ask for in one status request. A reply's length field is
+# a single byte and real panels stop answering well before that: an Omni
+# IIe returns 50 zones (203 bytes) but not 60. These keep every reply
+# under ~170 bytes given the per-record sizes (zone 4, unit 5,
+# thermostat 14, area 6).
+STATUS_CHUNK_ZONES: Final = 32
+STATUS_CHUNK_UNITS: Final = 32
+STATUS_CHUNK_THERMOSTATS: Final = 8
+STATUS_CHUNK_AREAS: Final = 8
+
 # Background event-listener task name, surfaced to ``asyncio.all_tasks()``
 # for diagnostics.
 EVENT_TASK_NAME: Final = "omni_pca-event-listener"
