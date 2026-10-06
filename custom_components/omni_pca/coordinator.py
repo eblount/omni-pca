@@ -58,9 +58,12 @@ from omni_pca.events import (
     SystemEvent,
     UnitStateChanged,
     ZoneStateChanged,
+    parse_events,
 )
+from omni_pca.message import Message
 from omni_pca.models import (
     OBJECT_TYPE_TO_PROPERTIES,
+    OBJECT_TYPE_TO_STATUS,
     AreaProperties,
     AreaStatus,
     ButtonProperties,
@@ -268,13 +271,43 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
         # cycles; we close it explicitly on shutdown / failure.
         await client.__aenter__()
         self._client = client
+        await self._enable_notifications(client)
+        # A fresh connection has a fresh unsolicited queue, so the
+        # listener has to be (re)started for every connection, not just
+        # the first one.
+        await self._cancel_event_task()
+        self._start_event_task()
         return client
+
+    async def _enable_notifications(self, client: OmniClient) -> None:
+        """Ask the panel to push state changes on this session.
+
+        A real panel sends nothing unsolicited until the client asks:
+        without this an Omni IIe (fw 3.2r2) stays silent and every state
+        change waits for the next poll. Once enabled it pushes an
+        ExtendedStatus (opcode 59) message per changed object.
+
+        UDP/v1 sessions are left alone — the v1 dialect has no such
+        request.
+        """
+        if self._transport == "udp":
+            return
+        reply = await client.connection.request(
+            OmniLink2MessageType.EnableNotifications, b"\x01"
+        )
+        if reply.opcode != int(OmniLink2MessageType.Ack):
+            LOGGER.debug(
+                "panel did not accept EnableNotifications (opcode %d); "
+                "relying on polling",
+                reply.opcode,
+            )
 
     async def _drop_client(self) -> None:
         if self._client is None:
             return
         client = self._client
         self._client = None
+        await self._cancel_event_task()
         try:
             await client.__aexit__(None, None, None)
         except Exception:  # pragma: no cover - best-effort cleanup
@@ -804,14 +837,73 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
         if client is None:
             return
         try:
-            async for event in client.events():
-                self._apply_event(event)
+            if self._transport == "udp":
+                async for event in client.events():
+                    self._apply_event(event)
+            else:
+                async for message in client.connection.unsolicited():
+                    self._handle_unsolicited(message)
         except asyncio.CancelledError:
             raise
         except (OmniConnectionError, RequestTimeoutError, OSError):
             LOGGER.debug("event listener exited on transport error", exc_info=True)
         except Exception:  # pragma: no cover - defensive
             LOGGER.exception("event listener crashed")
+
+    def _handle_unsolicited(self, message: Message) -> None:
+        """Route one pushed v2 message to the matching state patch."""
+        try:
+            if message.opcode == int(OmniLink2MessageType.SystemEvents):
+                for event in parse_events(message):
+                    self._apply_event(event)
+            elif message.opcode == int(OmniLink2MessageType.ExtendedStatus):
+                self._apply_pushed_status(message.payload)
+        except Exception:
+            # One undecodable push must not end the listener; the next
+            # poll resyncs whatever it carried.
+            LOGGER.debug(
+                "ignoring undecodable push (opcode %d)", message.opcode, exc_info=True
+            )
+
+    def _apply_pushed_status(self, payload: bytes) -> None:
+        """Merge an unsolicited ExtendedStatus message into ``self.data``.
+
+        Same layout as the polled reply: ``[object type][record size]``
+        followed by one or more records. Only objects found at discovery
+        are merged, matching what the poll keeps.
+        """
+        data = self.data
+        if data is None or len(payload) < 2:
+            return
+        parser = OBJECT_TYPE_TO_STATUS.get(payload[0])
+        record_size = payload[1]
+        if parser is None or record_size == 0:
+            return
+        records = [
+            parser.parse(payload[off : off + record_size])
+            for off in range(2, len(payload) - record_size + 1, record_size)
+        ]
+        targets: tuple[tuple[type, str, dict[int, Any]], ...] = (
+            (ZoneStatus, "zone_status", data.zones),
+            (UnitStatus, "unit_status", data.units),
+            (AreaStatus, "area_status", data.areas),
+            (ThermostatStatus, "thermostat_status", data.thermostats),
+        )
+        for status_type, field_name, known in targets:
+            fresh = {
+                r.index: r
+                for r in records
+                if isinstance(r, status_type) and r.index in known
+            }
+            if not fresh:
+                continue
+            merged = {**getattr(data, field_name), **fresh}
+            self.data = replace(data, **{field_name: merged})
+            # Notify entities without async_set_updated_data, which would
+            # push the next poll back on every event and could starve it
+            # in a busy house.
+            self.async_update_listeners()
+            return
 
     def _apply_event(self, event: SystemEvent) -> None:
         """Patch ``self.data`` in place for the relevant event subclass."""
