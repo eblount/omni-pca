@@ -290,7 +290,7 @@ class OmniProgramsSensor(
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        from omni_pca.programs import ProgramType
+        from .bundled.programs import ProgramType
 
         summaries: list[dict[str, Any]] = []
         for slot in sorted(self.coordinator.data.programs):

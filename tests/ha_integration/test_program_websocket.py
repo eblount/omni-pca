@@ -20,6 +20,17 @@ from omni_pca.commands import Command
 from omni_pca.programs import Days, Program, ProgramType
 
 
+@pytest.fixture(autouse=True)
+def _writes_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The write commands ship disabled; turn them on to exercise them.
+
+    The disabled default is covered by ``test_program_view_only.py``.
+    """
+    monkeypatch.setattr(
+        "custom_components.omni_pca.websocket.PROGRAM_WRITES_ENABLED", True
+    )
+
+
 @pytest.fixture
 def seeded_programs() -> dict[int, Program]:
     """A small set of programs covering the main shapes the viewer renders.

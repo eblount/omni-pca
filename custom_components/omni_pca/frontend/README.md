@@ -35,6 +35,10 @@ The panel calls three websocket commands (all defined in
 * `omni_pca/programs/get`  — full structured-English detail for one slot.
 * `omni_pca/programs/fire` — sends `Command.EXECUTE_PROGRAM` over the wire.
 
+The list response carries `can_write`. While it is false (the integration's
+`PROGRAM_WRITES_ENABLED` constant) the panel is view-only: the detail pane
+shows no actions and the server refuses every write command.
+
 The frontend doesn't subscribe to push events; live-state badges
 refresh on a low-frequency poll (`REFRESH_MS = 5000`). That's a
 deliberate scope choice — switching to per-entity event subscription

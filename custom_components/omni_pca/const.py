@@ -51,6 +51,10 @@ EVENT_TASK_NAME: Final = "omni_pca-event-listener"
 # zones / units / areas, so we stop early when discovery returns EOD.
 MAX_OBJECT_INDEX: Final = 0xFFFF
 
+# Whether the Omni Programs panel may change the panel's programs. While
+# False every write command is refused and the panel shows no actions.
+PROGRAM_WRITES_ENABLED: Final = False
+
 # Length, in characters, of a hex-encoded 16-byte controller key.
 CONTROLLER_KEY_HEX_LEN: Final = 32
 

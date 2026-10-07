@@ -36,6 +36,8 @@ export interface ProgramListResponse {
   filtered_total: number;
   offset: number;
   limit: number;
+  /** False while the integration is view-only: hide every action. */
+  can_write?: boolean;
 }
 
 export interface ProgramDetail {
@@ -187,7 +189,7 @@ export interface DecodedEvent {
   category: EventCategory;
   /** For "button": 1..255 */
   button?: number;
-  /** For "zone": 1..256, plus state 0=secure / 1=not-ready / 2=trouble / 3=tamper */
+  /** For "zone": 1..511, plus state 0=secure / 1=not-ready */
   zone?: number;
   zoneState?: number;
   /** For "unit": 1..511 plus on bool */
@@ -209,7 +211,7 @@ export const FIXED_EVENTS: ReadonlyArray<{ id: number; label: string }> = [
   { id: 773, label: "AC power restored" },
 ];
 
-const ZONE_STATE_LABELS = ["secure", "not ready", "trouble", "tamper"];
+const ZONE_STATE_LABELS = ["secure", "not ready"];
 
 export function decodeEventId(eventId: number): DecodedEvent {
   // FIXED first — the bit patterns below would otherwise collapse
@@ -221,20 +223,20 @@ export function decodeEventId(eventId: number): DecodedEvent {
   if ((eventId & 0xFF00) === 0x0000) {
     return { category: "button", button: eventId & 0xFF };
   }
+  // Zone and unit events: bit 9 is the state, the low 9 bits the object
+  // number (0x0605 = zone 5 not ready on a real panel).
   if ((eventId & 0xFC00) === 0x0400) {
-    const zs = eventId & 0x03FF;
     return {
       category: "zone",
-      zone: Math.floor(zs / 4) + 1,
-      zoneState: zs % 4,
+      zone: eventId & 0x01FF,
+      zoneState: (eventId & 0x0200) ? 1 : 0,
     };
   }
   if ((eventId & 0xFC00) === 0x0800) {
-    const us = eventId & 0x03FF;
     return {
       category: "unit",
-      unit: Math.floor(us / 2) + 1,
-      unitOn: (us & 1) === 1,
+      unit: eventId & 0x01FF,
+      unitOn: (eventId & 0x0200) !== 0,
     };
   }
   return { category: "raw", raw: eventId };
@@ -245,14 +247,12 @@ export function encodeEventId(ev: DecodedEvent): number {
     case "button":
       return (ev.button ?? 1) & 0xFF;
     case "zone": {
-      const zone = (ev.zone ?? 1) - 1;
-      const state = (ev.zoneState ?? 0) & 0x03;
-      return 0x0400 | ((zone * 4 + state) & 0x03FF);
+      const zone = (ev.zone ?? 1) & 0x01FF;
+      return 0x0400 | (ev.zoneState ? 0x0200 : 0) | zone;
     }
     case "unit": {
-      const unit = (ev.unit ?? 1) - 1;
-      const on = ev.unitOn ? 1 : 0;
-      return 0x0800 | ((unit * 2 + on) & 0x03FF);
+      const unit = (ev.unit ?? 1) & 0x01FF;
+      return 0x0800 | (ev.unitOn ? 0x0200 : 0) | unit;
     }
     case "fixed":
       return ev.fixedId ?? 768;

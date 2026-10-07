@@ -78,8 +78,8 @@ from omni_pca.models import (
     ZoneStatus,
 )
 from omni_pca.opcodes import OmniLink2MessageType
-from omni_pca.programs import Program
 
+from .bundled.programs import Program
 from .const import (
     DOMAIN,
     EVENT_TASK_NAME,
@@ -92,6 +92,7 @@ from .const import (
     STATUS_CHUNK_UNITS,
     STATUS_CHUNK_ZONES,
 )
+from .program_io import async_iter_programs, program_from_library_file
 
 # --------------------------------------------------------------------------
 # Public data shape exposed to entities
@@ -472,15 +473,15 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
            * v1 (UDP): adapter forwards to OmniClientV1.iter_programs(),
              a bare UploadPrograms stream ack-walked to EOD.
 
-        Both paths yield :class:`omni_pca.programs.Program` and skip
-        empty slots. Errors are logged and swallowed — programs are
+        Both paths yield the bundled :class:`Program` (see
+        :mod:`.program_io` for why) and skip empty slots. Errors are logged and swallowed — programs are
         non-critical discovery, so a partial list beats blocking setup.
         """
         if self._pca_path:
             return await self._discover_programs_from_pca()
         out: dict[int, Program] = {}
         try:
-            async for prog in client.iter_programs():
+            async for prog in async_iter_programs(client):
                 if prog.slot is not None:
                     out[prog.slot] = prog
         except (OmniConnectionError, RequestTimeoutError):
@@ -517,10 +518,10 @@ class OmniDataUpdateCoordinator(DataUpdateCoordinator[OmniData]):
             )
             return {}
         out: dict[int, Program] = {}
-        for prog in acct.programs:
-            if prog.slot is None or prog.is_empty():
+        for lib_prog in acct.programs:
+            if lib_prog.slot is None or lib_prog.is_empty():
                 continue
-            out[prog.slot] = prog
+            out[lib_prog.slot] = program_from_library_file(lib_prog)
         return out
 
     async def _walk_properties(

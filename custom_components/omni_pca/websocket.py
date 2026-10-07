@@ -28,16 +28,17 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
 from omni_pca.commands import Command
-from omni_pca.program_engine import ClausalChain, build_chains
-from omni_pca.program_renderer import (
+
+from .bundled.program_engine import ClausalChain, build_chains
+from .bundled.program_renderer import (
     NameResolver,
     ProgramRenderer,
     StateResolver,
     Token,
 )
-from omni_pca.programs import Program, ProgramType
-
-from .const import DOMAIN
+from .bundled.programs import Program, ProgramType
+from .const import DOMAIN, LOGGER, PROGRAM_WRITES_ENABLED
+from .program_io import async_clear_program, async_write_program
 
 if TYPE_CHECKING:
     from .coordinator import OmniDataUpdateCoordinator
@@ -214,6 +215,7 @@ def _classify_trigger(p: Program) -> str:
         vol.Optional("offset"): vol.All(int, vol.Range(min=0)),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_list_programs(
     hass: HomeAssistant,
@@ -313,6 +315,7 @@ async def _ws_list_programs(
         "filtered_total": filtered_total,
         "offset": offset,
         "limit": limit,
+        "can_write": PROGRAM_WRITES_ENABLED,
     })
 
 
@@ -323,6 +326,7 @@ async def _ws_list_programs(
         vol.Required("slot"): vol.All(int, vol.Range(min=1, max=1500)),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_get_program(
     hass: HomeAssistant,
@@ -400,6 +404,18 @@ async def _ws_get_program(
     })
 
 
+def _refuse_write(
+    connection: websocket_api.ActiveConnection, msg: dict[str, Any],
+) -> bool:
+    """Send a ``read_only`` error and return True while writes are disabled."""
+    if PROGRAM_WRITES_ENABLED:
+        return False
+    connection.send_error(
+        msg["id"], "read_only", "program editing is not enabled in this release",
+    )
+    return True
+
+
 def _program_to_fields(program: Program) -> dict[str, Any]:
     """Serialise a Program for the editor form. Mirrors the field
     layout of :func:`_PROGRAM_FIELD_SCHEMA` so a round-trip
@@ -450,6 +466,7 @@ _PROGRAM_FIELD_SCHEMA = vol.Schema(
         vol.Required("actions"): [dict],
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_chain_write(
     hass: HomeAssistant,
@@ -475,6 +492,8 @@ async def _ws_chain_write(
          case) so leftover continuation records don't get mis-associated
          with the now-shorter chain.
     """
+    if _refuse_write(connection, msg):
+        return
     coordinator = _coordinator_for_entry(hass, msg["entry_id"])
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
@@ -484,8 +503,6 @@ async def _ws_chain_write(
     except RuntimeError as err:
         connection.send_error(msg["id"], "not_connected", str(err))
         return
-
-    from omni_pca.programs import Program  # local — avoid cycle
 
     # Validate every member dict against the per-record schema (used
     # individually so each member can have its own defaults).
@@ -509,8 +526,6 @@ async def _ws_chain_write(
     # Find the existing chain (if any) so we know which old slots are
     # currently part of this program. Without an existing chain we still
     # allow writing — that's the "create chain at this empty slot" case.
-    from omni_pca.program_engine import build_chains
-
     programs = coordinator.data.programs if coordinator.data else {}
     existing = next(
         (c for c in build_chains(tuple(programs.values()))
@@ -559,7 +574,7 @@ async def _ws_chain_write(
     # Write them in order.
     try:
         for slot, prog in new_records:
-            await client.download_program(slot, prog)
+            await async_write_program(client, slot, prog)
     except NotImplementedError as err:
         connection.send_error(msg["id"], "not_supported", str(err))
         return
@@ -573,10 +588,10 @@ async def _ws_chain_write(
     to_clear = existing_slots - set(new_slot_range)
     for slot in sorted(to_clear):
         try:
-            await client.clear_program(slot)
+            await async_clear_program(client, slot)
         except Exception:
             # Don't fail the whole write for a clear-failure; log and continue.
-            _log.warning("failed to clear shrunk-away slot %s", slot)
+            LOGGER.warning("failed to clear shrunk-away slot %s", slot)
 
     # Update coordinator state. Same shape as single-slot write: drop
     # cleared slots, set written slots.
@@ -599,6 +614,7 @@ async def _ws_chain_write(
         vol.Required("entry_id"): str,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_list_objects(
     hass: HomeAssistant,
@@ -645,6 +661,7 @@ async def _ws_list_objects(
         vol.Required("program"): dict,
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_write_program(
     hass: HomeAssistant,
@@ -654,7 +671,7 @@ async def _ws_write_program(
     """Write an arbitrary Program record to ``slot``.
 
     The ``program`` payload is a JSON-friendly dict mirroring the
-    :class:`omni_pca.programs.Program` dataclass — every field passed
+    bundled :class:`Program` dataclass — every field passed
     by name. Default 0 for fields the caller omits (matches the
     dataclass defaults). ``remark_id`` is optional / None.
 
@@ -663,6 +680,8 @@ async def _ws_write_program(
     update ``coordinator.data.programs[slot]`` immediately so the
     next list call shows the edit before the next poll catches up.
     """
+    if _refuse_write(connection, msg):
+        return
     coordinator = _coordinator_for_entry(hass, msg["entry_id"])
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
@@ -678,11 +697,9 @@ async def _ws_write_program(
         connection.send_error(msg["id"], "not_connected", str(err))
         return
 
-    from omni_pca.programs import Program  # local — avoid cycle
-
     program = Program(slot=msg["slot"], **validated)
     try:
-        await client.download_program(msg["slot"], program)
+        await async_write_program(client, msg["slot"], program)
     except NotImplementedError as err:
         connection.send_error(msg["id"], "not_supported", str(err))
         return
@@ -703,6 +720,7 @@ async def _ws_write_program(
         vol.Required("slot"): vol.All(int, vol.Range(min=1, max=1500)),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_clear_program(
     hass: HomeAssistant,
@@ -715,6 +733,8 @@ async def _ws_clear_program(
     ``not_supported`` because their wire protocol only allows bulk
     rewrites (which would clear everything).
     """
+    if _refuse_write(connection, msg):
+        return
     coordinator = _coordinator_for_entry(hass, msg["entry_id"])
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
@@ -725,7 +745,7 @@ async def _ws_clear_program(
         connection.send_error(msg["id"], "not_connected", str(err))
         return
     try:
-        await client.clear_program(msg["slot"])
+        await async_clear_program(client, msg["slot"])
     except NotImplementedError as err:
         connection.send_error(msg["id"], "not_supported", str(err))
         return
@@ -747,6 +767,7 @@ async def _ws_clear_program(
         vol.Required("target_slot"): vol.All(int, vol.Range(min=1, max=1500)),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_clone_program(
     hass: HomeAssistant,
@@ -762,6 +783,8 @@ async def _ws_clone_program(
     Refuses to clone when source and target are the same slot or when
     the source slot is empty / not defined.
     """
+    if _refuse_write(connection, msg):
+        return
     coordinator = _coordinator_for_entry(hass, msg["entry_id"])
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
@@ -787,7 +810,6 @@ async def _ws_clone_program(
         return
     # The Program dataclass carries the slot field; re-stamp it for the
     # destination so the on-the-wire bytes are correctly addressed.
-    from omni_pca.programs import Program  # local — avoid cycle
     cloned = Program(
         slot=dst,
         prog_type=source_program.prog_type,
@@ -804,7 +826,7 @@ async def _ws_clone_program(
         remark_id=source_program.remark_id,
     )
     try:
-        await client.download_program(dst, cloned)
+        await async_write_program(client, dst, cloned)
     except NotImplementedError as err:
         connection.send_error(msg["id"], "not_supported", str(err))
         return
@@ -825,6 +847,7 @@ async def _ws_clone_program(
         vol.Required("slot"): vol.All(int, vol.Range(min=1, max=1500)),
     }
 )
+@websocket_api.require_admin
 @websocket_api.async_response
 async def _ws_fire_program(
     hass: HomeAssistant,
@@ -932,7 +955,7 @@ async def async_register_side_panel(hass: HomeAssistant) -> None:
         sidebar_icon="mdi:script-text-outline",
         module_url=_PANEL_JS_PATH,
         embed_iframe=False,
-        require_admin=False,
+        require_admin=True,
     )
 
 

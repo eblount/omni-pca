@@ -97,6 +97,9 @@ export class OmniPanelPrograms extends LitElement {
   @state() private _filteredTotal = 0;
   @state() private _loading = false;
   @state() private _error: string | null = null;
+  // False until the integration reports that program writes are enabled;
+  // while false the detail pane shows no actions at all.
+  @state() private _canWrite = false;
 
   // Filters
   @state() private _activeTriggerTypes: Set<string> = new Set();
@@ -234,6 +237,7 @@ export class OmniPanelPrograms extends LitElement {
       this._rows = result.programs;
       this._total = result.total;
       this._filteredTotal = result.filtered_total;
+      this._canWrite = result.can_write === true;
     } catch (err) {
       this._error = err instanceof Error ? err.message : String(err);
     } finally {
@@ -919,6 +923,7 @@ export class OmniPanelPrograms extends LitElement {
           <button type="button" class="close" @click=${this._closeDetail}>×</button>
         </header>
         <pre class="detail-body">${renderTokens(d.tokens, (k, i) => this._onRefClick(k, i))}</pre>
+        ${this._canWrite ? html`
         <footer>
           <button
             type="button"
@@ -953,7 +958,10 @@ export class OmniPanelPrograms extends LitElement {
             <span class="fire-feedback">${this._fireFeedback}</span>` : ""}
           ${this._writeFeedback ? html`
             <span class="fire-feedback">${this._writeFeedback}</span>` : ""}
-        </footer>
+        </footer>` : html`
+        <footer>
+          <span class="fire-feedback">View only — editing is not enabled.</span>
+        </footer>`}
         ${this._showCloneInput ? html`
           <div class="action-row">
             <label>Clone slot ${d.slot} → target slot:
@@ -1171,8 +1179,6 @@ export class OmniPanelPrograms extends LitElement {
           <select @change=${this._onEventZoneStateChange}>
             <option value="0" ?selected=${decoded.zoneState === 0}>secure</option>
             <option value="1" ?selected=${decoded.zoneState === 1}>not ready</option>
-            <option value="2" ?selected=${decoded.zoneState === 2}>trouble</option>
-            <option value="3" ?selected=${decoded.zoneState === 3}>tamper</option>
           </select>
         </label>`;
     }
@@ -1720,8 +1726,6 @@ export class OmniPanelPrograms extends LitElement {
           })}>
             <option value="0" ?selected=${decoded.zoneState === 0}>secure</option>
             <option value="1" ?selected=${decoded.zoneState === 1}>not ready</option>
-            <option value="2" ?selected=${decoded.zoneState === 2}>trouble</option>
-            <option value="3" ?selected=${decoded.zoneState === 3}>tamper</option>
           </select>
         </label>`;
     }
