@@ -632,17 +632,18 @@ def test_event_id_user_macro_button_rejects_out_of_range() -> None:
 
 
 def test_event_id_zone_state_encodes_zone_and_state() -> None:
-    # Zone 1 state 0 (secure) → 0x0400 base.
-    assert event_id_zone_state(1, 0) == 0x0400
-    assert event_id_zone_state(1, 3) == 0x0403  # tamper
-    # Zone 2 state 0 = 0x0404 (2-1)*4+0
-    assert event_id_zone_state(2, 0) == 0x0404
+    # Values seen on a real Omni IIe: bit 9 is "not ready".
+    assert event_id_zone_state(5, 0) == 0x0405
+    assert event_id_zone_state(5, 1) == 0x0605
+    assert event_id_zone_state(15, 1) == 0x060F
+    with pytest.raises(ValueError):
+        event_id_zone_state(5, 2)
 
 
 def test_event_id_unit_state_encodes_unit_and_on_off() -> None:
-    assert event_id_unit_state(1, on=False) == 0x0800
-    assert event_id_unit_state(1, on=True) == 0x0801
-    assert event_id_unit_state(2, on=True) == 0x0803
+    assert event_id_unit_state(1, on=False) == 0x0801
+    assert event_id_unit_state(1, on=True) == 0x0A01
+    assert event_id_unit_state(77, on=True) == 0x0A4D
 
 
 @pytest.mark.asyncio

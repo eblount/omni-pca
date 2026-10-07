@@ -29,10 +29,13 @@ Offset      Field
 ==========  ==============================================
 
 **Byte order:** all 16-bit fields above are **little-endian**
-(byte N is the low byte, byte N+1 is the high byte). This was
-empirically confirmed against PC Access — see findings notes
-in ``pca-re/clausal-re/FINDINGS.md``. Older versions of this
-module decoded them as BE; the LE encoding is correct.
+(byte N is the low byte, byte N+1 is the high byte) **in a .pca
+file**. This was empirically confirmed against PC Access — see
+findings notes in ``pca-re/clausal-re/FINDINGS.md``. On the wire the
+same fields are big-endian, confirmed against a real Omni IIe;
+:meth:`Program.from_wire_bytes` and :meth:`Program.from_file_record`
+each apply the right order, so the dataclass fields mean the same
+thing whichever way the record arrived.
 
 When ``prog_type == Remark`` (4), bytes 1-4 hold a 32-bit BE
 RemarkID instead of cond/cond2; the lookup table that resolves an
@@ -527,8 +530,23 @@ def _warn_unknown(category: str, value: int) -> None:
     )
 
 
-def _decode_common(body: bytes) -> dict[str, object]:
-    """Decode the fields that don't depend on the file-vs-wire layout."""
+def _u16(body: bytes, offset: int, *, big_endian: bool) -> int:
+    if big_endian:
+        return (body[offset] << 8) | body[offset + 1]
+    return (body[offset + 1] << 8) | body[offset]
+
+
+def _put_u16(buf: bytearray, offset: int, value: int, *, big_endian: bool) -> None:
+    hi, lo = (value >> 8) & 0xFF, value & 0xFF
+    buf[offset], buf[offset + 1] = (hi, lo) if big_endian else (lo, hi)
+
+
+def _decode_common(body: bytes, *, big_endian: bool = False) -> dict[str, object]:
+    """Decode the fields shared by the file and wire layouts.
+
+    ``big_endian`` selects the byte order of ``cond`` / ``cond2`` /
+    ``pr2``: little-endian in a ``.pca`` file, big-endian on the wire.
+    """
     if len(body) != PROGRAM_BYTES:
         raise ValueError(
             f"program record must be {PROGRAM_BYTES} bytes, got {len(body)}"
@@ -550,14 +568,17 @@ def _decode_common(body: bytes) -> dict[str, object]:
         cond2 = 0
     else:
         remark_id = None
-        # cond, cond2, pr2 are little-endian u16 — empirically confirmed
-        # by authoring known programs in PC Access and diffing bytes.
-        cond = (body[2] << 8) | body[1]
-        cond2 = (body[4] << 8) | body[3]
+        # In a .pca file cond, cond2 and pr2 are little-endian u16 —
+        # empirically confirmed by authoring known programs in PC Access
+        # and diffing bytes. On the wire they are big-endian — confirmed
+        # against an Omni IIe (fw 3.2), where ``0a 4d`` at bytes 1-2 is
+        # "unit 77 is ON" and ``00 0e`` at bytes 7-8 is unit 14.
+        cond = _u16(body, 1, big_endian=big_endian)
+        cond2 = _u16(body, 3, big_endian=big_endian)
 
     cmd = body[5]
     par = body[6]
-    pr2 = (body[8] << 8) | body[7]
+    pr2 = _u16(body, 7, big_endian=big_endian)
     days = body[11]
     hour = body[12]
     minute = body[13]
@@ -575,11 +596,11 @@ def _decode_common(body: bytes) -> dict[str, object]:
     }
 
 
-def _encode_common(p: Program) -> bytearray:
-    """Encode the layout-independent fields into a fresh 14-byte buffer.
+def _encode_common(p: Program, *, big_endian: bool = False) -> bytearray:
+    """Encode the fields shared by both layouts into a fresh 14-byte buffer.
 
     Bytes 9 and 10 (month/day) are left zero — the layout-specific
-    encoder fills them in.
+    encoder fills them in. ``big_endian`` as for :func:`_decode_common`.
     """
     buf = bytearray(PROGRAM_BYTES)
     buf[0] = p.prog_type & 0xFF
@@ -590,15 +611,11 @@ def _encode_common(p: Program) -> bytearray:
         buf[3] = (rid >> 8) & 0xFF
         buf[4] = rid & 0xFF
     else:
-        # cond, cond2, pr2 are little-endian — see _decode_common
-        buf[1] = p.cond & 0xFF
-        buf[2] = (p.cond >> 8) & 0xFF
-        buf[3] = p.cond2 & 0xFF
-        buf[4] = (p.cond2 >> 8) & 0xFF
+        _put_u16(buf, 1, p.cond, big_endian=big_endian)
+        _put_u16(buf, 3, p.cond2, big_endian=big_endian)
     buf[5] = p.cmd & 0xFF
     buf[6] = p.par & 0xFF
-    buf[7] = p.pr2 & 0xFF
-    buf[8] = (p.pr2 >> 8) & 0xFF
+    _put_u16(buf, 7, p.pr2, big_endian=big_endian)
     # 9, 10 filled by encode_{wire,file}_bytes
     buf[11] = p.days & 0xFF
     buf[12] = p.hour & 0xFF
@@ -657,9 +674,10 @@ class Program:
 
         "Wire" here means the payload that ``clsOLMsgProgramData``
         sends after its 2-byte BE ProgramNumber header — bytes 9/10
-        are always ``[month, day]`` regardless of ``prog_type``.
+        are always ``[month, day]`` regardless of ``prog_type``, and
+        the 16-bit fields are big-endian.
         """
-        f = _decode_common(body)
+        f = _decode_common(body, big_endian=True)
         return cls(slot=slot, month=body[9], day=body[10], **f)  # type: ignore[arg-type]
 
     @classmethod
@@ -683,7 +701,7 @@ class Program:
 
     def encode_wire_bytes(self) -> bytes:
         """Encode to the on-the-wire 14-byte body (no Mon/Day swap)."""
-        buf = _encode_common(self)
+        buf = _encode_common(self, big_endian=True)
         buf[9] = self.month & 0xFF
         buf[10] = self.day & 0xFF
         return bytes(buf)

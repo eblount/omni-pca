@@ -453,27 +453,53 @@ def event_id_user_macro_button(button: int) -> int:
 def event_id_zone_state(zone: int, state: int) -> int:
     """Event ID for a zone-state change.
 
-    Category mask: ``(evt & 0xFC00) == 0x0400`` (high bits 0b000001).
-    Low 10 bits encode zone × state per clsText: ``(zone - 1) * 4 + state``
-    where state is the 2-bit "current_state" code (0=secure, 1=not-ready,
-    2=trouble, 3=tamper). Range fits 256 zones × 4 states = 1024 IDs.
+    Category mask: ``(evt & 0xFC00) == 0x0400``. Bit 9 is the state
+    (0 = secure, 1 = not ready) and the low 9 bits the zone number —
+    the same layout as the ZONE condition family. Confirmed against a
+    real Omni IIe, where ``0x0605`` is "zone 5 not ready" and
+    ``0x0405`` is "zone 5 secure".
     """
-    if not 1 <= zone <= 256:
-        raise ValueError(f"zone {zone} out of range 1..256")
-    if not 0 <= state <= 3:
-        raise ValueError(f"state {state} out of range 0..3")
-    return 0x0400 | (((zone - 1) * 4 + state) & 0x03FF)
+    if not 1 <= zone <= 511:
+        raise ValueError(f"zone {zone} out of range 1..511")
+    if state not in (0, 1):
+        raise ValueError(f"state {state} must be 0 (secure) or 1 (not ready)")
+    return 0x0400 | (state << 9) | zone
 
 
 def event_id_unit_state(unit: int, on: bool) -> int:
     """Event ID for a unit (light/output) state change.
 
-    Category mask: ``(evt & 0xFC00) == 0x0800``. Low bits encode
-    ``(unit - 1) * 2 + (1 if on else 0)`` per clsText.
+    Category mask: ``(evt & 0xFC00) == 0x0800``. Bit 9 is on/off and
+    the low 9 bits the unit number. Not yet seen on a real panel; the
+    layout is inferred from the zone events and the CTRL condition
+    family, which both use it.
     """
     if not 1 <= unit <= 511:
         raise ValueError(f"unit {unit} out of range 1..511")
-    return 0x0800 | (((unit - 1) * 2 + (1 if on else 0)) & 0x03FF)
+    return 0x0800 | ((1 if on else 0) << 9) | unit
+
+
+def event_id_all_units(on: bool, area: int = 0) -> int:
+    """Event ID for an ALL ON / ALL OFF. ``area`` 0 means every area."""
+    if not 0 <= area <= 15:
+        raise ValueError(f"area {area} out of range 0..15")
+    return 0x03E0 | ((1 if on else 0) << 4) | area
+
+
+def event_id_security_mode(mode: int, area: int = 0, code: int = 0) -> int:
+    """Event ID for a security-mode change.
+
+    Bit 15 set, bits 12-14 the mode (0 = Off .. 6 = Night Delayed),
+    bits 8-11 the area (0 = any) and the low byte the user code
+    (0 = any). Inferred from a real Omni IIe's programs, where
+    ``0x8000`` / ``0xA000`` / ``0xB000`` / ``0xC000`` trigger its
+    disarm / night / away / vacation routines.
+    """
+    if not 0 <= mode <= 7:
+        raise ValueError(f"mode {mode} out of range 0..7")
+    if not 0 <= area <= 15:
+        raise ValueError(f"area {area} out of range 0..15")
+    return 0x8000 | (mode << 12) | (area << 8) | (code & 0xFF)
 
 
 # Hand-rolled fixed-ID events from clsText.cs:1647-... (PHONE/AC_POWER/etc.).

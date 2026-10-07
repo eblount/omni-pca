@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Protocol, runtime_checkable
 
 from .commands import Command
+from .models import omni_temp_to_fahrenheit
 from .programs import (
     CondArgType,
     CondOP,
@@ -274,6 +275,32 @@ def format_days(mask: int) -> str:
     return ", ".join(parts) if parts else "(no days)"
 
 
+_SETPOINT_COMMANDS: frozenset[int] = frozenset({
+    int(Command.SET_THERMOSTAT_HEAT_SETPOINT),
+    int(Command.SET_THERMOSTAT_COOL_SETPOINT),
+})
+_UPB_LINK_COMMANDS: frozenset[int] = frozenset({
+    int(Command.UPB_LINK_OFF),
+    int(Command.UPB_LINK_ON),
+})
+
+
+def format_duration(par: int) -> str:
+    """Render the duration byte of a unit command.
+
+    The panel packs it as 1-99 = seconds, 101-199 = 1-99 minutes and
+    201-218 = 1-18 hours. Zero means "until changed" and renders as an
+    empty string, as does any value outside those ranges.
+    """
+    if 1 <= par <= 99:
+        return f"{par} sec"
+    if 101 <= par <= 199:
+        return f"{par - 100} min"
+    if 201 <= par <= 218:
+        return f"{par - 200} hr"
+    return ""
+
+
 # Command → ("verb", expects_pr2_object_kind) lookup. ``None`` for the
 # second element means "no object reference" — the command's parameters
 # are the action's payload alone.
@@ -290,6 +317,11 @@ _COMMAND_VERBS: dict[int, tuple[str, str | None]] = {
     int(Command.UNIT_RAMP):    ("Ramp",           "unit"),
     int(Command.DIM_STEP):     ("Dim",            "unit"),
     int(Command.BRIGHT_STEP):  ("Brighten",       "unit"),
+    int(Command.TIMED_LEVEL):  ("Set level",      None),
+    int(Command.UPB_LINK_OFF): ("UPB link OFF",   None),
+    int(Command.UPB_LINK_ON):  ("UPB link ON",    None),
+    int(Command.SET_THERMOSTAT_HEAT_SETPOINT): ("Set heat setpoint", None),
+    int(Command.SET_THERMOSTAT_COOL_SETPOINT): ("Set cool setpoint", None),
     int(Command.SECURITY_OFF): ("Disarm",         "area"),
     int(Command.SECURITY_DAY): ("Arm Day",        "area"),
     int(Command.SECURITY_NIGHT): ("Arm Night",    "area"),
@@ -456,7 +488,7 @@ class ProgramRenderer:
         elif head.prog_type == int(ProgramType.AT):
             out.append(Token(TokenKind.KEYWORD, "AT"))
             out.append(Token(TokenKind.TEXT, " "))
-            out.append(Token(TokenKind.VALUE, head.format_time()))
+            out.append(Token(TokenKind.VALUE, head.format_time().removeprefix("at ")))
             out.append(Token(TokenKind.TEXT, " "))
             out.append(Token(TokenKind.VALUE, format_days(head.days)))
         elif head.prog_type == int(ProgramType.EVERY):
@@ -484,7 +516,7 @@ class ProgramRenderer:
     def _emit_timed_header(self, p: Program, out: list[Token]) -> None:
         out.append(Token(TokenKind.KEYWORD, "AT"))
         out.append(Token(TokenKind.TEXT, " "))
-        out.append(Token(TokenKind.VALUE, p.format_time()))
+        out.append(Token(TokenKind.VALUE, p.format_time().removeprefix("at ")))
         out.append(Token(TokenKind.TEXT, " "))
         out.append(Token(TokenKind.VALUE, format_days(p.days)))
 
@@ -513,7 +545,7 @@ class ProgramRenderer:
     def _emit_at_header(self, p: Program, out: list[Token]) -> None:
         out.append(Token(TokenKind.KEYWORD, "AT"))
         out.append(Token(TokenKind.TEXT, " "))
-        out.append(Token(TokenKind.VALUE, p.format_time()))
+        out.append(Token(TokenKind.VALUE, p.format_time().removeprefix("at ")))
         out.append(Token(TokenKind.TEXT, " "))
         out.append(Token(TokenKind.VALUE, format_days(p.days)))
 
@@ -523,7 +555,7 @@ class ProgramRenderer:
         out.append(Token(TokenKind.VALUE, _format_interval(p.every_interval)))
 
     def _emit_timed_summary(self, p: Program, out: list[Token]) -> None:
-        out.append(Token(TokenKind.VALUE, p.format_time()))
+        out.append(Token(TokenKind.VALUE, p.format_time().removeprefix("at ")))
         out.append(Token(TokenKind.TEXT, " "))
         out.append(Token(TokenKind.VALUE, format_days(p.days)))
 
@@ -568,27 +600,49 @@ class ProgramRenderer:
             self._emit_ref("button", button, out)
             out.append(Token(TokenKind.TEXT, " is pressed"))
             return
-        # ZONE_STATE_CHANGE (& 0xFC00 == 0x0400)
-        if (event_id & 0xFC00) == 0x0400:
-            zone_state = event_id & 0x03FF
-            zone = (zone_state // 4) + 1
-            state = zone_state % 4
-            self._emit_ref("zone", zone, out)
-            state_label = {
-                0: "becomes secure",
-                1: "becomes not ready",
-                2: "reports trouble",
-                3: "reports tamper",
-            }.get(state, f"changes to state {state}")
-            out.append(Token(TokenKind.TEXT, " " + state_label))
+        # ALL ON / ALL OFF (0x03E0-0x03FF): bit 4 = on, low nibble = area.
+        if (event_id & 0xFFE0) == 0x03E0:
+            out.append(Token(
+                TokenKind.TEXT,
+                "ALL ON" if event_id & 0x0010 else "ALL OFF",
+            ))
+            area = event_id & 0x000F
+            if area:
+                out.append(Token(TokenKind.TEXT, " in "))
+                self._emit_ref("area", area, out)
             return
-        # UNIT_STATE_CHANGE (& 0xFC00 == 0x0800)
+        # ZONE_STATE_CHANGE (& 0xFC00 == 0x0400): bit 9 = not ready.
+        if (event_id & 0xFC00) == 0x0400:
+            self._emit_ref("zone", event_id & 0x01FF, out)
+            out.append(Token(
+                TokenKind.TEXT,
+                " becomes not ready" if event_id & 0x0200 else " becomes secure",
+            ))
+            return
+        # UNIT_STATE_CHANGE (& 0xFC00 == 0x0800): bit 9 = on.
         if (event_id & 0xFC00) == 0x0800:
-            unit_state = event_id & 0x03FF
-            unit = (unit_state // 2) + 1
-            on = unit_state & 1
-            self._emit_ref("unit", unit, out)
-            out.append(Token(TokenKind.TEXT, " turns " + ("ON" if on else "OFF")))
+            self._emit_ref("unit", event_id & 0x01FF, out)
+            out.append(Token(
+                TokenKind.TEXT, " turns " + ("ON" if event_id & 0x0200 else "OFF"),
+            ))
+            return
+        # SECURITY MODE CHANGE (bit 15): bits 12-14 = mode, 8-11 = area,
+        # low byte = user code (0 = any).
+        if event_id & 0x8000:
+            mode = (event_id >> 12) & 0x07
+            area = (event_id >> 8) & 0x0F
+            code = event_id & 0xFF
+            if area:
+                self._emit_ref("area", area, out)
+            else:
+                out.append(Token(TokenKind.TEXT, "any area"))
+            out.append(Token(TokenKind.TEXT, " is set to "))
+            out.append(Token(
+                TokenKind.VALUE, _SECURITY_MODE_NAMES.get(mode, f"mode {mode}"),
+            ))
+            if code:
+                out.append(Token(TokenKind.TEXT, " by "))
+                self._emit_ref("code", code, out)
             return
         out.append(Token(TokenKind.TEXT, f"event 0x{event_id:04x}"))
 
@@ -655,47 +709,14 @@ class ProgramRenderer:
         ``and_family`` is the family+selector byte; ``and_instance`` is
         the object index (1-based).
         """
-        family = c.and_family
-        instance = c.and_instance
-        family_major = family & 0xFC
-        secondary = bool(family & 0x02)
-        if family_major == 0:
-            self._emit_misc_conditional(family & 0x0F, out)
-            return
-        if family_major == ProgramCond.ZONE:
-            self._emit_ref("zone", instance, out)
-            out.append(Token(TokenKind.TEXT, " is "))
-            out.append(Token(
-                TokenKind.OPERATOR, "not ready" if secondary else "secure",
-            ))
-            return
-        if family_major == ProgramCond.CTRL:
-            self._emit_ref("unit", instance, out)
-            out.append(Token(TokenKind.TEXT, " is "))
-            out.append(Token(
-                TokenKind.OPERATOR, "ON" if secondary else "OFF",
-            ))
-            return
-        if family_major == ProgramCond.TIME:
-            out.append(Token(TokenKind.TEXT, "Time clock "))
-            out.append(Token(TokenKind.VALUE, str(instance)))
-            out.append(Token(TokenKind.TEXT, " is "))
-            out.append(Token(
-                TokenKind.OPERATOR,
-                "enabled" if secondary else "disabled",
-            ))
-            return
-        # SEC: high nibble = mode, low = area
-        area = family & 0x0F
-        mode = (family >> 4) & 0x07
-        if area == 0:
-            area = 1
-        self._emit_ref("area", area, out)
-        out.append(Token(TokenKind.TEXT, " is "))
-        out.append(Token(
-            TokenKind.VALUE,
-            _SECURITY_MODE_NAMES.get(mode, f"mode {mode}"),
-        ))
+        # Together the two bytes are the same u16 a compact-form
+        # ``cond`` carries (family byte high, instance low), so render it
+        # the same way. Doing it per byte would lose the misc-conditional
+        # code and bit 8 of a unit number, which both live in the
+        # instance byte.
+        self._emit_traditional_cond(
+            ((c.and_family & 0xFF) << 8) | (c.and_instance & 0xFF), out,
+        )
 
     def _emit_misc_conditional(self, misc_code: int, out: list[Token]) -> None:
         try:
@@ -778,12 +799,50 @@ class ProgramRenderer:
         verb_entry = _COMMAND_VERBS.get(cmd_byte)
         verb, ref_kind = verb_entry if verb_entry else (cmd.name.replace("_", " "), None)
         out.append(Token(TokenKind.KEYWORD, verb))
+        if cmd == Command.TIMED_LEVEL:
+            # pr2 packs the level (high byte) and the unit (low byte);
+            # par is how long to hold it.
+            out.append(Token(TokenKind.TEXT, " "))
+            self._emit_ref("unit", p.pr2 & 0xFF, out)
+            out.append(Token(TokenKind.TEXT, " to "))
+            out.append(Token(TokenKind.VALUE, f"{(p.pr2 >> 8) & 0xFF}%"))
+            self._emit_duration(p.par, out)
+            return
+        if cmd in (Command.ALL_OFF, Command.ALL_ON):
+            if p.pr2:
+                out.append(Token(TokenKind.TEXT, " in "))
+                self._emit_ref("area", p.pr2, out)
+            return
+        if cmd in _SETPOINT_COMMANDS:
+            out.append(Token(TokenKind.TEXT, " on "))
+            if p.pr2:
+                self._emit_ref("thermostat", p.pr2, out)
+            else:
+                out.append(Token(TokenKind.TEXT, "all thermostats"))
+            out.append(Token(TokenKind.TEXT, " to "))
+            out.append(Token(
+                TokenKind.VALUE, f"{omni_temp_to_fahrenheit(p.par):.0f}°F",
+            ))
+            return
+        if cmd in _UPB_LINK_COMMANDS:
+            out.append(Token(TokenKind.TEXT, " "))
+            out.append(Token(TokenKind.VALUE, str(p.pr2)))
+            return
         if ref_kind is not None:
             out.append(Token(TokenKind.TEXT, " "))
             self._emit_ref(ref_kind, p.pr2, out)
         if cmd == Command.UNIT_LEVEL:
             out.append(Token(TokenKind.TEXT, " to "))
             out.append(Token(TokenKind.VALUE, f"{p.par}%"))
+        elif cmd in (Command.UNIT_OFF, Command.UNIT_ON):
+            self._emit_duration(p.par, out)
+
+    def _emit_duration(self, par: int, out: list[Token]) -> None:
+        """Append `` for <time>`` when ``par`` carries a duration."""
+        text = format_duration(par)
+        if text:
+            out.append(Token(TokenKind.TEXT, " for "))
+            out.append(Token(TokenKind.VALUE, text))
 
     # ---- emit helpers — refs ---------------------------------------------
 
