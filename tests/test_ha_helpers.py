@@ -65,6 +65,25 @@ class TestDeviceClassForZoneType:
     def test_zero_is_opening(self) -> None:
         assert helpers.device_class_for_zone_type(0) == "opening"
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("BR HALL MOTION", "motion"),
+            ("Pantry Door", "door"),
+            ("ATTIC WINDOW", "window"),
+            ("AUX 1", "opening"),
+            ("", "opening"),
+        ],
+    )
+    def test_auxiliary_uses_zone_name(self, name: str, expected: str) -> None:
+        assert helpers.device_class_for_zone_type(64, name) == expected
+
+    def test_auxiliary_without_name_is_opening(self) -> None:
+        assert helpers.device_class_for_zone_type(64) == "opening"
+
+    def test_name_ignored_for_other_zone_types(self) -> None:
+        assert helpers.device_class_for_zone_type(1, "HALL MOTION") == "opening"
+
 
 class TestIsBinaryZoneType:
     @pytest.mark.parametrize("analog_type", [80, 81, 82, 83, 84])

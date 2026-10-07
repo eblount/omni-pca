@@ -41,7 +41,8 @@ DEVICE_CLASS_COLD: Final = "cold"
 #   * Gas                                           → gas
 #   * Tamper / latching tamper                      → tamper
 #   * Panic / police / silent duress / aux-emerg    → safety
-#   * Temperature / humidity / aux                  → not a binary sensor
+#   * Auxiliary                                     → from the zone name
+#   * Temperature / humidity                        → not a binary sensor
 #     (callers should skip — see ``is_binary_zone_type``)
 #
 # The default for any unmapped value is "opening", which matches the
@@ -76,8 +77,8 @@ _ZONE_TYPE_TO_DEVICE_CLASS: dict[int, str] = {
     49: DEVICE_CLASS_PROBLEM,  # TROUBLE
     54: DEVICE_CLASS_COLD,     # FREEZE
     55: DEVICE_CLASS_MOISTURE,  # WATER
-    # Sound / aux
-    64: DEVICE_CLASS_SOUND,    # AUXILIARY (loose mapping; use sound)
+    # Aux — AUXILIARY (64) is resolved from the zone name instead, see
+    # ``device_class_for_zone_type``.
     65: DEVICE_CLASS_OPENING,  # KEYSWITCH
     66: DEVICE_CLASS_OPENING,  # SHUNT_LOCK
 }
@@ -95,14 +96,35 @@ _ANALOG_ZONE_TYPES: frozenset[int] = frozenset({
 })
 
 
-def device_class_for_zone_type(zone_type: int) -> str:
+# AUXILIARY zones never raise an alarm, so the zone type says nothing
+# about what is wired to them — real panels use them for hallway PIRs,
+# interior doors and the like. The zone name is the only hint we have, so
+# we look for these words in it (first match wins).
+_ZONE_TYPE_AUXILIARY: Final = 64
+_AUXILIARY_NAME_HINTS: tuple[tuple[str, str], ...] = (
+    ("motion", DEVICE_CLASS_MOTION),
+    ("window", DEVICE_CLASS_WINDOW),
+    ("door", DEVICE_CLASS_DOOR),
+)
+
+
+def device_class_for_zone_type(zone_type: int, name: str = "") -> str:
     """Return the HA ``BinarySensorDeviceClass`` value for an Omni zone type.
 
     Defaults to ``"opening"`` — the most common contact-sensor case — for
     any zone-type byte we don't have an explicit mapping for. Callers
     should check :func:`is_binary_zone_type` first to decide whether the
     zone makes sense as a binary sensor at all.
+
+    ``name`` is the zone's panel name. It is only consulted for AUXILIARY
+    zones, whose type doesn't describe the sensor.
     """
+    if zone_type == _ZONE_TYPE_AUXILIARY:
+        lowered = name.lower()
+        for hint, device_class in _AUXILIARY_NAME_HINTS:
+            if hint in lowered:
+                return device_class
+        return DEVICE_CLASS_OPENING
     return _ZONE_TYPE_TO_DEVICE_CLASS.get(zone_type, DEVICE_CLASS_OPENING)
 
 

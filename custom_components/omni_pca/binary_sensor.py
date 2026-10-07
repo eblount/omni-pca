@@ -4,7 +4,8 @@ Per-zone entities
 -----------------
 * :class:`OmniZoneBinarySensor` — one per discovered zone. ``is_on``
   derives from :class:`~omni_pca.models.ZoneStatus`. The HA device class
-  is picked from the zone-type byte by
+  is picked from the zone-type byte (and, for auxiliary zones, the zone
+  name) by
   :func:`~custom_components.omni_pca.helpers.device_class_for_zone_type`.
 * :class:`OmniZoneBypassedBinarySensor` — one per discovered zone.
   Diagnostic entity (``problem`` device-class) that turns on when the
@@ -139,7 +140,7 @@ class OmniZoneBinarySensor(_OmniZoneBaseEntity):
         props = coordinator.data.zones[index]
         self._attr_name = prettify_name(props.name) or f"Zone {index}"
         self._attr_device_class = BinarySensorDeviceClass(
-            device_class_for_zone_type(props.zone_type)
+            device_class_for_zone_type(props.zone_type, props.name)
         )
 
     @property
