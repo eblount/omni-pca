@@ -331,6 +331,9 @@ async def _ws_list_programs(
         "limit": limit,
         # First slot after everything in use; None when the table is full.
         "next_free_slot": _next_free_slot(programs),
+        # The panel script compares this with the version it was built
+        # for and stops offering changes if they differ.
+        "version": await _integration_version(hass),
         "can_write": PROGRAM_WRITES_ENABLED,
         "can_edit_chains": PROGRAM_WRITES_ENABLED and PROGRAM_CHAIN_WRITES_ENABLED,
         "can_fire": PROGRAM_WRITES_ENABLED and PROGRAM_FIRE_ENABLED,
@@ -420,6 +423,13 @@ async def _ws_get_program(
         # underlying integer values to round-trip cleanly.
         "fields": _program_to_fields(target),
     })
+
+
+async def _integration_version(hass: HomeAssistant) -> str:
+    """This integration's version, as declared in manifest.json."""
+    from homeassistant.loader import async_get_integration
+
+    return str((await async_get_integration(hass, DOMAIN)).version)
 
 
 def _next_free_slot(programs: dict[int, Program]) -> int | None:
@@ -1244,7 +1254,10 @@ async def async_register_side_panel(hass: HomeAssistant) -> None:
         webcomponent_name=_PANEL_WEBCOMPONENT,
         sidebar_title="Omni Programs",
         sidebar_icon="mdi:script-text-outline",
-        module_url=_PANEL_JS_PATH,
+        # The version in the URL makes a browser fetch the script again
+        # after every upgrade instead of running a cached older editor
+        # against a newer server.
+        module_url=f"{_PANEL_JS_PATH}?v={await _integration_version(hass)}",
         embed_iframe=False,
         require_admin=True,
     )

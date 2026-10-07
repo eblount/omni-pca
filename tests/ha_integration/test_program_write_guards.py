@@ -65,6 +65,30 @@ async def test_fire_is_refused(
     assert mock.state.programs == before
 
 
+async def test_panel_script_is_tied_to_the_integration_version(
+    hass: HomeAssistant, configured_panel, hass_ws_client
+) -> None:
+    """The script URL carries the version (so an upgrade is not served
+    from the browser cache) and the list reports it (so a script that is
+    stale anyway can tell)."""
+    import json
+    from pathlib import Path
+
+    import custom_components.omni_pca as integration
+
+    version = json.loads(
+        (Path(integration.__file__).parent / "manifest.json").read_text()
+    )["version"]
+    panel = hass.data["frontend_panels"]["omni-panel-programs"]
+    module_url = panel.config["_panel_custom"]["module_url"]
+    assert module_url == f"/api/omni_pca/panel.js?v={version}"
+
+    response = await _call(
+        hass, hass_ws_client, configured_panel, {"type": "omni_pca/programs/list"}
+    )
+    assert response["result"]["version"] == version
+
+
 @pytest.mark.parametrize(
     "command",
     [

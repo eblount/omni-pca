@@ -38,6 +38,8 @@ export interface ProgramListResponse {
   filtered_total: number;
   offset: number;
   limit: number;
+  /** The integration version the server is running. */
+  version?: string;
   /** First slot after everything in use; null when the table is full. */
   next_free_slot?: number | null;
   /** Edit / clone / clear of single-line programs, and undo. */

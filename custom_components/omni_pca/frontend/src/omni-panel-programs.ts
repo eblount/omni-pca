@@ -82,6 +82,9 @@ const TRIGGER_TYPES = [
   "TIMED", "EVENT", "YEARLY", "WHEN", "AT", "EVERY", "REMARK",
 ] as const;
 
+// The integration version this script was built for (set by build.mjs).
+declare const __PANEL_VERSION__: string;
+
 // How often the live-state overlay refreshes. Low enough that a panel
 // fire shows up promptly, high enough that 330 programs × 4-byte deltas
 // don't generate websocket noise.
@@ -114,6 +117,7 @@ export class OmniPanelPrograms extends LitElement {
   @state() private _canEditChains = false;
   @state() private _canFire = false;
   @state() private _nextFreeSlot: number | null = null;
+  @state() private _serverVersion: string | null = null;
   // Set when a multi-line save was refused for lack of room.
   @state() private _relocateOffer = false;
   // Change journal (undo), loaded when the History view is opened.
@@ -257,9 +261,14 @@ export class OmniPanelPrograms extends LitElement {
       this._rows = result.programs;
       this._total = result.total;
       this._filteredTotal = result.filtered_total;
-      this._canWrite = result.can_write === true;
-      this._canEditChains = result.can_edit_chains === true;
-      this._canFire = result.can_fire === true;
+      // A browser can keep running an older copy of this script after
+      // the integration is upgraded. Its forms may not match what the
+      // server now accepts, so offer no changes until the page reloads.
+      this._serverVersion = result.version ?? null;
+      const stale = this._isStale();
+      this._canWrite = !stale && result.can_write === true;
+      this._canEditChains = !stale && result.can_edit_chains === true;
+      this._canFire = !stale && result.can_fire === true;
       this._nextFreeSlot = result.next_free_slot ?? null;
     } catch (err) {
       this._error = errorText(err);
@@ -726,6 +735,11 @@ export class OmniPanelPrograms extends LitElement {
     this._editingDraft = packEventIdIntoFields(this._editingDraft, eventId);
   }
 
+  private _isStale(): boolean {
+    return this._serverVersion !== null
+      && this._serverVersion !== __PANEL_VERSION__;
+  }
+
   // -- change history / undo --------------------------------------------
 
   private _toggleHistory(): void {
@@ -880,6 +894,16 @@ export class OmniPanelPrograms extends LitElement {
       ${this._showHistory ? this._renderHistory() : ""}
       ${this._error ? html`
         <div class="error">${this._error}</div>` : ""}
+      ${this._isStale() ? html`
+        <div class="error">
+          This page is running an older copy of the panel
+          (${__PANEL_VERSION__}) than Home Assistant (${this._serverVersion}).
+          Reload the page to update it — Ctrl+Shift+R, or pull down to
+          refresh in the app. Changes are switched off until then.
+          <button type="button" @click=${() => window.location.reload()}>
+            Reload
+          </button>
+        </div>` : ""}
       ${this._renderFilters()}
       <div class="body" data-narrow=${this.narrow}>
         ${this._renderList()}
