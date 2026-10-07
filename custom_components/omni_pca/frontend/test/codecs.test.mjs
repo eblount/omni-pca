@@ -49,8 +49,34 @@ const fixture = join(here, "..", "..", "..", "..", "tests", "fixtures", "omni_ii
 if (existsSync(fixture)) {
   const programs = JSON.parse(readFileSync(fixture, "utf8")).programs;
   let checked = 0;
+  let blockLines = 0;
   for (const [slot, hex] of Object.entries(programs)) {
     const b = hex.split(" ").map((x) => parseInt(x, 16));
+    // Every line of a multi-line program must be editable too.
+    if (b[0] === 5) {
+      assert.notEqual(t.decodeEventId((b[9] << 8) | b[10]).category, "raw", `slot ${slot}: WHEN event`);
+      blockLines++;
+      continue;
+    }
+    if (b[0] === 8 || b[0] === 9) {
+      const fields = { prog_type: b[0], cond: (b[1] << 8) | b[2], cond2: (b[3] << 8) | b[4] };
+      assert.equal(t.isStructuredAnd(fields), false, `slot ${slot}: structured condition`);
+      const word = t.andConditionWord(fields);
+      assert.notEqual(t.decodeCondition(word).family, "raw", `slot ${slot}: AND condition`);
+      assert.deepEqual(t.encodeAndCondition(t.decodeCondition(word)),
+        { cond: fields.cond, cond2: fields.cond2 }, `slot ${slot}: AND round trip`);
+      blockLines++;
+      continue;
+    }
+    if (b[0] === 10) {
+      assert.ok(t.commandOptionFor(b[5]), `slot ${slot}: THEN command ${b[5]} has no form`);
+      if ([0, 1, 101].includes(b[5])) {
+        assert.notEqual(t.decodeDuration(b[6]).unit, "raw", `slot ${slot}: duration ${b[6]}`);
+      }
+      blockLines++;
+      continue;
+    }
+    if (b[0] === 6) { blockLines++; continue; }
     if (b[0] < 1 || b[0] > 3) continue;
     const cond = (b[1] << 8) | b[2];
     const cond2 = (b[3] << 8) | b[4];
@@ -65,6 +91,7 @@ if (existsSync(fixture)) {
     checked++;
   }
   console.log(`real table: ${checked} single-line programs fully editable`);
+  console.log(`real table: ${blockLines} lines of multi-line programs fully editable`);
 } else {
   console.log("real table: fixture not present, skipped");
 }

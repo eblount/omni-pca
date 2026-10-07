@@ -57,9 +57,10 @@ MAX_OBJECT_INDEX: Final = 0xFFFF
 # PROGRAM_WRITES_ENABLED is the master switch: edit, clone and clear of
 # single-line (timed / event / yearly) programs, plus undo.
 PROGRAM_WRITES_ENABLED: Final = True
-# Rewriting multi-line WHEN/AT/EVERY blocks, which moves records between
-# slots. Off until the block editor has been checked against real layouts.
-PROGRAM_CHAIN_WRITES_ENABLED: Final = False
+# Editing, cloning and deleting multi-line WHEN/AT/EVERY blocks. "Is
+# compared with" conditions inside a block stay read-only (see the
+# frontend's STRUCTURED_EDIT_ENABLED).
+PROGRAM_CHAIN_WRITES_ENABLED: Final = True
 # "Fire now". Off: the command it sends has not been tried on a real panel.
 PROGRAM_FIRE_ENABLED: Final = False
 

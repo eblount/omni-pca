@@ -11,6 +11,15 @@ Every change the Omni Programs panel makes goes through
    panel holds anything other than what was sent;
 4. updates the coordinator's cached table from what was verified.
 
+A multi-line block is several records in adjacent slots, and the panel
+keeps running while they are rewritten. Changes flagged ``block`` are
+therefore written so the panel never holds a misleading mix: every
+affected slot that is in use is first freed from the last slot
+backwards (a block loses its actions before its conditions and its
+trigger, and no line is ever left behind a different program), then the
+new records are written from the first slot forwards (a block gains its
+trigger and all its conditions before any action).
+
 The journal lives in Home Assistant's ``.storage`` and is what
 :meth:`ProgramChanges.async_undo` works from. The first time it is
 created it also snapshots the whole program table as a baseline.
@@ -139,12 +148,20 @@ class ProgramChanges:
         user_id: str | None,
         expect_before: dict[int, set[bytes]] | None = None,
         undoes: str | None = None,
-    ) -> dict[str, Any]:
-        """Write ``changes`` in order, journalled and verified.
+        block: bool = False,
+    ) -> dict[str, Any] | None:
+        """Write ``changes`` (one per slot), journalled and verified.
 
         ``expect_before`` maps a slot to the bodies it is allowed to hold
         beforehand; anything else means the panel changed under us and
         the whole change is refused before a single write.
+
+        ``block`` selects the free-backwards-then-write-forwards order
+        described in the module docstring; without it each slot is
+        simply overwritten, in the order given.
+
+        Returns the journal entry, or ``None`` if the panel already
+        holds exactly what was asked for (nothing written or journalled).
         """
         async with self._lock:
             data = await self._async_load()
@@ -158,6 +175,8 @@ class ProgramChanges:
                         f"slot {slot} no longer holds what was expected; "
                         "reload and try again",
                     )
+            if all(before[c.slot] == c.body for c in changes):
+                return None
 
             entry: dict[str, Any] = {
                 "id": uuid.uuid4().hex[:12],
@@ -176,13 +195,26 @@ class ProgramChanges:
             }
             if undoes is not None:
                 entry["undoes"] = undoes
+            if block:
+                entry["block"] = True
             data["entries"].append(entry)
             del data["entries"][:-_MAX_ENTRIES]
             await self._store.async_save(data)
 
             try:
-                for change in changes:
-                    await self._async_write_verified(change)
+                if block:
+                    in_use = sorted(
+                        (c.slot for c in changes if before[c.slot] != _EMPTY),
+                        reverse=True,
+                    )
+                    for slot in in_use:
+                        await self._async_write_verified(SlotChange(slot, None))
+                    for change in sorted(changes, key=lambda c: c.slot):
+                        if change.program is not None:
+                            await self._async_write_verified(change)
+                else:
+                    for change in changes:
+                        await self._async_write_verified(change)
             except Exception as err:
                 entry["status"] = STATUS_FAILED
                 entry["error"] = str(err)
@@ -264,10 +296,17 @@ class ProgramChanges:
             c["slot"]: {_from_hex(c["before"]), _from_hex(c["after"])}
             for c in target["changes"]
         }
+        if target.get("block"):
+            # A block change that failed part-way leaves freed slots.
+            for allowed in expect.values():
+                allowed.add(_EMPTY)
         entry = await self.async_apply(
             "undo", changes, user_id=user_id, expect_before=expect,
-            undoes=journal_id,
+            undoes=journal_id, block=bool(target.get("block")),
         )
+        if entry is None:
+            # A failed change that never altered the panel: nothing to put back.
+            entry = {"id": None, "action": "undo", "changes": []}
         target["status"] = STATUS_UNDONE
         await self._store.async_save(data)
         return entry

@@ -43,9 +43,9 @@ import {
   ProgramListResponse,
   ProgramRow,
   SECURITY_MODE_NAMES,
+  andConditionWord,
   argTypeKind,
   commandOptionFor,
-  decodeAndCondition,
   decodeCondition,
   decodeDuration,
   decodeEventId,
@@ -53,7 +53,6 @@ import {
   emptyAndRecord,
   emptyOrRecord,
   emptyThenRecord,
-  encodeAndCondition,
   encodeCondition,
   encodeDuration,
   encodeEventId,
@@ -73,6 +72,11 @@ import {
 // runnable program). Clausal types (WHEN/AT/EVERY) are kind="chain"
 // not "compact" so they're filtered out earlier in _beginEdit.
 const EDITABLE_PROG_TYPES = new Set(["TIMED", "EVENT", "YEARLY"]);
+
+// Editing "comparison" conditions (TEMP > 70 and the like). Their record
+// layout has only been seen in .pca files, never on a real panel's wire,
+// so existing ones are kept as they are and none can be created.
+const STRUCTURED_EDIT_ENABLED = false;
 
 const TRIGGER_TYPES = [
   "TIMED", "EVENT", "YEARLY", "WHEN", "AT", "EVERY", "REMARK",
@@ -110,6 +114,8 @@ export class OmniPanelPrograms extends LitElement {
   @state() private _canEditChains = false;
   @state() private _canFire = false;
   @state() private _nextFreeSlot: number | null = null;
+  // Set when a multi-line save was refused for lack of room.
+  @state() private _relocateOffer = false;
   // Change journal (undo), loaded when the History view is opened.
   @state() private _showHistory = false;
   @state() private _history: JournalEntry[] | null = null;
@@ -299,14 +305,15 @@ export class OmniPanelPrograms extends LitElement {
 
   private async _clearProgram(slot: number): Promise<void> {
     if (!this._entryId) return;
-    this._writeFeedback = "clearing…";
+    this._writeFeedback = "deleting…";
     try {
-      await this.hass.connection.sendMessagePromise({
-        type: "omni_pca/programs/clear",
-        entry_id: this._entryId,
-        slot,
-      });
-      this._writeFeedback = `cleared slot ${slot}`;
+      await this.hass.connection.sendMessagePromise(
+        this._detail?.kind === "chain"
+          ? { type: "omni_pca/programs/chain/clear",
+              entry_id: this._entryId, head_slot: slot }
+          : { type: "omni_pca/programs/clear",
+              entry_id: this._entryId, slot });
+      this._writeFeedback = `deleted slot ${slot}`;
       this._confirmingClear = false;
       // Refresh the list + close the detail panel; the slot is gone.
       this._selectedSlot = null;
@@ -338,7 +345,8 @@ export class OmniPanelPrograms extends LitElement {
     this._writeFeedback = "cloning…";
     try {
       await this.hass.connection.sendMessagePromise({
-        type: "omni_pca/programs/clone",
+        type: this._detail?.kind === "chain"
+          ? "omni_pca/programs/chain/clone" : "omni_pca/programs/clone",
         entry_id: this._entryId,
         source_slot: sourceSlot,
         target_slot: target,
@@ -420,34 +428,62 @@ export class OmniPanelPrograms extends LitElement {
 
   private _cancelChainEdit(): void {
     this._chainDraft = null;
+    this._relocateOffer = false;
     this._startRefreshTimer();
   }
 
-  private async _saveChainDraft(): Promise<void> {
+  private async _saveChainDraft(relocate = false): Promise<void> {
     if (!this._chainDraft || !this._entryId) return;
-    this._writeFeedback = "saving chain…";
+    this._writeFeedback = "saving…";
+    this._relocateOffer = false;
     try {
-      await this.hass.connection.sendMessagePromise({
+      const result = await this.hass.connection.sendMessagePromise<
+        { head_slot: number }
+      >({
         type: "omni_pca/programs/chain/write",
         entry_id: this._entryId,
         head_slot: this._chainDraft.headSlot,
         head: this._chainDraft.head,
         conditions: this._chainDraft.conditions,
         actions: this._chainDraft.actions,
+        // What the editor loaded: the server refuses the save if the
+        // program has changed on the panel since.
+        ...(this._detail?.chain_members
+          ? { original: this._detail.chain_members.map((m) => m.fields) }
+          : {}),
+        relocate,
       });
-      this._writeFeedback = `saved chain @ slot ${this._chainDraft.headSlot}`;
-      const headSlot = this._chainDraft.headSlot;
+      this._writeFeedback = `saved at slot ${result.head_slot}`;
       this._chainDraft = null;
       this._startRefreshTimer();
+      this._selectedSlot = result.head_slot;
       await this._loadList();
-      await this._loadDetail(headSlot);
+      await this._loadDetail(result.head_slot);
     } catch (err) {
-      const m = errorText(err);
-      this._writeFeedback = `error: ${m}`;
-      setTimeout(() => { this._writeFeedback = null; }, 15000);
+      // "no_room": the program grew and the next slot is taken. The
+      // message says where it can go; offer to move it there.
+      this._relocateOffer =
+        (err as { code?: string })?.code === "no_room" && !relocate;
+      this._writeFeedback = `error: ${errorText(err)}`;
+      setTimeout(() => { this._writeFeedback = null; }, 30000);
       return;
     }
     setTimeout(() => { this._writeFeedback = null; }, 4000);
+  }
+
+  private _chainSlotNote(
+    d: ProgramDetail, draft: { headSlot: number; conditions: unknown[]; actions: unknown[] },
+  ): string {
+    const lines = 1 + draft.conditions.length + draft.actions.length;
+    const was = d.chain_slots?.length ?? lines;
+    const last = draft.headSlot + lines - 1;
+    if (lines === was) return `${lines} lines, slots #${draft.headSlot}–${last}.`;
+    if (lines < was) {
+      return `${lines} lines (was ${was}): slots #${draft.headSlot}–${last}; `
+        + `the rest are freed.`;
+    }
+    return `${lines} lines (was ${was}): needs slots #${draft.headSlot}–${last}. `
+      + `If the next slot is in use you'll be offered a move to free slots.`;
   }
 
   // ---- chain draft mutation helpers ---------------------------------
@@ -577,31 +613,21 @@ export class OmniPanelPrograms extends LitElement {
     this._editingDraft = { ...this._editingDraft, ...patch };
   }
 
-  private _toggleDayBit(bit: number): void {
-    if (!this._editingDraft) return;
-    const current = this._editingDraft.days ?? 0;
-    const next = current ^ bit;
-    this._patchDraft({ days: next });
-  }
-
-  private _onCommandChange(e: Event): void {
-    const value = parseInt((e.target as HTMLSelectElement).value, 10);
-    const draft = this._editingDraft;
-    if (!Number.isFinite(value) || !draft) return;
+  /** The field changes that go with picking a different command. */
+  private _commandPatch(
+    fields: ProgramFields, value: number,
+  ): Partial<ProgramFields> | null {
     const opt = commandOptionFor(value);
-    if (!opt) return;
-    const prev = commandOptionFor(draft.cmd ?? 0);
+    if (!opt) return null;
+    const prev = commandOptionFor(fields.cmd ?? 0);
     // Same form (ON <-> OFF, heat <-> cool, …): par and pr2 keep their
     // meaning, so only the command changes.
-    if (prev && prev.form === opt.form) {
-      this._patchDraft({ cmd: value });
-      return;
-    }
+    if (prev && prev.form === opt.form) return { cmd: value };
     const firstOf = (kind: string) => this._pickBucket(kind)?.[0]?.index ?? 1;
     // Carry the unit across the three unit forms.
     let unit = firstOf("unit");
-    if (prev?.form === "unit" || prev?.form === "level") unit = draft.pr2 ?? unit;
-    if (prev?.form === "timed-level") unit = (draft.pr2 ?? unit) & 0xFF;
+    if (prev?.form === "unit" || prev?.form === "level") unit = fields.pr2 ?? unit;
+    if (prev?.form === "timed-level") unit = (fields.pr2 ?? unit) & 0xFF;
     let par = 0;
     let pr2 = 0;
     switch (opt.form) {
@@ -615,7 +641,7 @@ export class OmniPanelPrograms extends LitElement {
       case "setpoint":    pr2 = 0; par = fToRawTemp(70); break;
       case "all":         pr2 = 0; break;
     }
-    this._patchDraft({ cmd: value, par, pr2 });
+    return { cmd: value, par, pr2 };
   }
 
   private _pickBucket(kind: string): NamedObject[] | null {
@@ -698,91 +724,6 @@ export class OmniPanelPrograms extends LitElement {
     if (!this._editingDraft) return;
     const eventId = encodeEventId(decoded);
     this._editingDraft = packEventIdIntoFields(this._editingDraft, eventId);
-  }
-
-  private _onEventCategoryChange(e: Event): void {
-    const cat = (e.target as HTMLSelectElement).value as EventCategory;
-    // Switching category — seed sensible defaults for the new category
-    // so the sub-fields below have valid initial values.
-    if (cat === "button") {
-      const firstButton = this._objects?.buttons?.[0]?.index ?? 1;
-      this._patchEvent({ category: "button", button: firstButton });
-    } else if (cat === "zone") {
-      const firstZone = this._objects?.zones?.[0]?.index ?? 1;
-      this._patchEvent({ category: "zone", zone: firstZone, zoneState: 1 });
-    } else if (cat === "unit") {
-      const firstUnit = this._objects?.units?.[0]?.index ?? 1;
-      this._patchEvent({ category: "unit", unit: firstUnit, unitOn: true });
-    } else if (cat === "allunits") {
-      this._patchEvent({ category: "allunits", allOn: false, area: 0 });
-    } else if (cat === "security") {
-      this._patchEvent({ category: "security", mode: 3, area: 0, code: 0 });
-    } else if (cat === "fixed") {
-      this._patchEvent({ category: "fixed", fixedId: 772 });  // AC lost
-    }
-    // "raw" isn't user-selectable from the dropdown — only appears when
-    // an existing event ID doesn't match a known pattern.
-  }
-
-  private _onEventButtonChange(e: Event): void {
-    const button = parseInt((e.target as HTMLSelectElement).value, 10);
-    if (Number.isFinite(button)) {
-      this._patchEvent({ category: "button", button });
-    }
-  }
-
-  private _onEventZoneChange(e: Event): void {
-    if (!this._editingDraft) return;
-    const zone = parseInt((e.target as HTMLSelectElement).value, 10);
-    if (!Number.isFinite(zone)) return;
-    const existing = decodeEventId(eventIdFromFields(this._editingDraft));
-    this._patchEvent({
-      category: "zone",
-      zone,
-      zoneState: existing.zoneState ?? 1,
-    });
-  }
-
-  private _onEventZoneStateChange(e: Event): void {
-    if (!this._editingDraft) return;
-    const state = parseInt((e.target as HTMLSelectElement).value, 10);
-    if (!Number.isFinite(state)) return;
-    const existing = decodeEventId(eventIdFromFields(this._editingDraft));
-    this._patchEvent({
-      category: "zone",
-      zone: existing.zone ?? 1,
-      zoneState: state,
-    });
-  }
-
-  private _onEventUnitChange(e: Event): void {
-    if (!this._editingDraft) return;
-    const unit = parseInt((e.target as HTMLSelectElement).value, 10);
-    if (!Number.isFinite(unit)) return;
-    const existing = decodeEventId(eventIdFromFields(this._editingDraft));
-    this._patchEvent({
-      category: "unit",
-      unit,
-      unitOn: existing.unitOn ?? true,
-    });
-  }
-
-  private _onEventUnitOnChange(e: Event): void {
-    if (!this._editingDraft) return;
-    const on = (e.target as HTMLSelectElement).value === "1";
-    const existing = decodeEventId(eventIdFromFields(this._editingDraft));
-    this._patchEvent({
-      category: "unit",
-      unit: existing.unit ?? 1,
-      unitOn: on,
-    });
-  }
-
-  private _onEventFixedChange(e: Event): void {
-    const id = parseInt((e.target as HTMLSelectElement).value, 10);
-    if (Number.isFinite(id)) {
-      this._patchEvent({ category: "fixed", fixedId: id });
-    }
   }
 
   // -- change history / undo --------------------------------------------
@@ -1053,7 +994,7 @@ export class OmniPanelPrograms extends LitElement {
               class="secondary"
               @click=${this._beginEdit}
             >Edit</button>` : ""}
-          ${singleLine ? html`
+          ${singleLine || (d.kind === "chain" && this._canEditChains) ? html`
           <button
             type="button"
             class="secondary"
@@ -1074,7 +1015,7 @@ export class OmniPanelPrograms extends LitElement {
               this._confirmingClear = !this._confirmingClear;
               this._showCloneInput = false;
             }}
-          >Clear</button>` : ""}
+          >Delete</button>` : ""}
           ${d.kind === "chain" && !this._canEditChains ? html`
             <span class="fire-feedback">Multi-line programs are view only for now.</span>` : ""}
           ${this._fireFeedback ? html`
@@ -1087,7 +1028,9 @@ export class OmniPanelPrograms extends LitElement {
         </footer>`}
         ${this._showCloneInput ? html`
           <div class="action-row">
-            <label>Clone slot ${d.slot} → target slot:
+            <label>${d.chain_slots && d.chain_slots.length > 1
+              ? `Copy all ${d.chain_slots.length} lines to slots starting at:`
+              : `Copy slot ${d.slot} to slot:`}
               <input
                 type="number"
                 min="1"
@@ -1110,20 +1053,25 @@ export class OmniPanelPrograms extends LitElement {
             >Cancel</button>
           </div>` : ""}
         ${this._confirmingClear ? html`
-          <div class="action-row danger-row">
-            <span>
-              <strong>Clear slot ${d.slot}?</strong>
-              This deletes the program from the panel.
+          <div class="action-row confirm-row">
+            <span class="confirm-text">
+              <strong>Delete this program from the panel?</strong>
+              ${d.chain_slots && d.chain_slots.length > 1
+                ? `All ${d.chain_slots.length} lines (slots #${d.chain_slots[0]}–${
+                    d.chain_slots[d.chain_slots.length - 1]}) are removed.`
+                : `Slot #${d.slot} is freed.`}
+              You can put it back from History.
             </span>
             <button
               type="button"
-              class="danger"
+              class="danger-solid"
               @click=${() => this._clearProgram(d.slot)}
-            >Yes, clear</button>
+            >Delete program</button>
             <button
               type="button"
+              class="secondary"
               @click=${() => { this._confirmingClear = false; }}
-            >Cancel</button>
+            >Keep it</button>
           </div>` : ""}
         ${d.chain_slots && d.chain_slots.length > 1 ? html`
           <div class="chain-info">
@@ -1186,39 +1134,99 @@ export class OmniPanelPrograms extends LitElement {
   }
 
   private _renderTimedTrigger(draft: ProgramFields): TemplateResult {
+    return this._renderTimeEditor("Time", draft, (p) => this._patchDraft(p));
+  }
+
+  private _renderEventTrigger(draft: ProgramFields): TemplateResult {
+    return this._renderEventEditor(
+      "Trigger event", eventIdFromFields(draft), (e) => this._patchEvent(e),
+    );
+  }
+
+  /** Time of day plus days of the week, shared by single-line TIMED
+   *  programs and the AT line of a multi-line one. The hour byte doubles
+   *  as a marker: 25 = sunrise, 26 = sunset, with the minute byte then a
+   *  signed offset in minutes. */
+  private _renderTimeEditor(
+    legend: string, f: ProgramFields,
+    patch: (p: Partial<ProgramFields>) => void,
+  ): TemplateResult {
+    const hour = f.hour ?? 0;
+    const minute = f.minute ?? 0;
+    const mode = hour === 25 ? "sunrise" : hour === 26 ? "sunset" : "clock";
+    const offset = minute >= 128 ? minute - 256 : minute;
+    const direction = offset === 0 ? "at" : offset < 0 ? "before" : "after";
+    const setOffset = (dir: string, amount: number) => {
+      const n = Math.min(Math.max(Math.round(amount) || 0, 0), 120);
+      const signed = dir === "at" ? 0 : dir === "before" ? -n : n;
+      patch({ minute: signed & 0xFF });
+    };
     return html`
       <fieldset>
-        <legend>Time</legend>
-        <div class="row">
-          <label>
-            Hour
-            <input
-              type="number" min="0" max="23"
-              .value=${String(draft.hour ?? 0)}
-              @input=${this._onHourChange}
-            />
-          </label>
-          <span class="time-colon">:</span>
-          <label>
-            Minute
-            <input
-              type="number" min="0" max="59" step="1"
-              .value=${String(draft.minute ?? 0)}
-              @input=${this._onMinuteChange}
-            />
-          </label>
-        </div>
-      </fieldset>
-      <fieldset>
-        <legend>Days</legend>
+        <legend>${legend}</legend>
+        <label class="block">
+          At
+          <select @change=${(e: Event) => {
+            const m = (e.target as HTMLSelectElement).value;
+            if (m === mode) return;
+            if (m === "sunrise") patch({ hour: 25, minute: 0 });
+            else if (m === "sunset") patch({ hour: 26, minute: 0 });
+            else patch({ hour: 18, minute: 0 });
+          }}>
+            <option value="clock" ?selected=${mode === "clock"}>a time of day</option>
+            <option value="sunrise" ?selected=${mode === "sunrise"}>sunrise</option>
+            <option value="sunset" ?selected=${mode === "sunset"}>sunset</option>
+          </select>
+        </label>
+        ${mode === "clock" ? html`
+          <div class="row">
+            <label>
+              Hour
+              <input type="number" min="0" max="23"
+                .value=${String(hour)}
+                @input=${(e: Event) => {
+                  const v = parseInt((e.target as HTMLInputElement).value, 10);
+                  if (Number.isFinite(v) && v >= 0 && v <= 23) patch({ hour: v });
+                }}
+              />
+            </label>
+            <span class="time-colon">:</span>
+            <label>
+              Minute
+              <input type="number" min="0" max="59"
+                .value=${String(minute)}
+                @input=${(e: Event) => {
+                  const v = parseInt((e.target as HTMLInputElement).value, 10);
+                  if (Number.isFinite(v) && v >= 0 && v <= 59) patch({ minute: v });
+                }}
+              />
+            </label>
+          </div>` : html`
+          <div class="row">
+            ${direction === "at" ? "" : html`
+              <input type="number" min="1" max="120"
+                .value=${String(Math.abs(offset))}
+                @input=${(e: Event) => setOffset(
+                  direction, parseInt((e.target as HTMLInputElement).value, 10))}
+              />
+              <span>min</span>`}
+            <select @change=${(e: Event) => {
+              const dir = (e.target as HTMLSelectElement).value;
+              setOffset(dir, Math.abs(offset) || 30);
+            }}>
+              <option value="at" ?selected=${direction === "at"}>exactly at ${mode}</option>
+              <option value="before" ?selected=${direction === "before"}>before ${mode}</option>
+              <option value="after" ?selected=${direction === "after"}>after ${mode}</option>
+            </select>
+          </div>`}
         <div class="days-row">
           ${DAY_BITS.map((d) => {
-            const active = ((draft.days ?? 0) & d.bit) !== 0;
+            const active = ((f.days ?? 0) & d.bit) !== 0;
             return html`
               <button
                 type="button"
                 class="day-toggle ${active ? "active" : ""}"
-                @click=${() => this._toggleDayBit(d.bit)}
+                @click=${() => patch({ days: (f.days ?? 0) ^ d.bit })}
               >${d.label}</button>
             `;
           })}
@@ -1227,173 +1235,148 @@ export class OmniPanelPrograms extends LitElement {
     `;
   }
 
-  private _renderEventTrigger(draft: ProgramFields): TemplateResult {
-    const eventId = eventIdFromFields(draft);
+  /** The "what sets this off" form, shared by single-line EVENT programs
+   *  and the WHEN line of a multi-line one. */
+  private _renderEventEditor(
+    legend: string, eventId: number, setEvent: (e: DecodedEvent) => void,
+  ): TemplateResult {
     const decoded = decodeEventId(eventId);
+    const first = (kind: string) => this._pickBucket(kind)?.[0]?.index ?? 1;
+    const setCategory = (cat: EventCategory) => {
+      if (cat === decoded.category) return;
+      // Seed sensible defaults so the sub-fields have valid values.
+      switch (cat) {
+        case "button":   setEvent({ category: "button", button: first("button") }); break;
+        case "zone":     setEvent({ category: "zone", zone: first("zone"), zoneState: 1 }); break;
+        case "unit":     setEvent({ category: "unit", unit: first("unit"), unitOn: true }); break;
+        case "allunits": setEvent({ category: "allunits", allOn: false, area: 0 }); break;
+        case "security": setEvent({ category: "security", mode: 3, area: 0, code: 0 }); break;
+        case "fixed":    setEvent({ category: "fixed", fixedId: 772 }); break;  // AC lost
+        case "raw":      break;  // only shown for an existing unknown event
+      }
+    };
+    const categories: Array<[EventCategory, string]> = [
+      ["button", "Button press"],
+      ["zone", "Zone state change"],
+      ["unit", "Unit state change"],
+      ["security", "Security mode set"],
+      ["allunits", "All ON / All OFF"],
+      ["fixed", "Fixed event (phone / AC)"],
+    ];
     return html`
       <fieldset>
-        <legend>Trigger event</legend>
+        <legend>${legend}</legend>
         <label class="block">
           Category
-          <select @change=${this._onEventCategoryChange}>
-            <option value="button"
-                    ?selected=${decoded.category === "button"}>
-              Button press
-            </option>
-            <option value="zone"
-                    ?selected=${decoded.category === "zone"}>
-              Zone state change
-            </option>
-            <option value="unit"
-                    ?selected=${decoded.category === "unit"}>
-              Unit state change
-            </option>
-            <option value="security"
-                    ?selected=${decoded.category === "security"}>
-              Security mode set
-            </option>
-            <option value="allunits"
-                    ?selected=${decoded.category === "allunits"}>
-              All ON / All OFF
-            </option>
-            <option value="fixed"
-                    ?selected=${decoded.category === "fixed"}>
-              Fixed event (phone / AC)
-            </option>
+          <select @change=${(e: Event) =>
+            setCategory((e.target as HTMLSelectElement).value as EventCategory)}>
+            ${categories.map(([value, label]) => html`
+              <option value=${value} ?selected=${decoded.category === value}>
+                ${label}
+              </option>`)}
             ${decoded.category === "raw" ? html`
               <option value="raw" selected>
-                Raw 0x${eventId.toString(16).padStart(4, "0")}
+                Raw 0x${eventId.toString(16).padStart(4, "0")} (kept as is)
               </option>` : ""}
           </select>
         </label>
-        ${this._renderEventCategoryFields(decoded)}
+        ${this._renderEventFields(decoded, setEvent)}
       </fieldset>
     `;
   }
 
-  private _renderEventCategoryFields(decoded: DecodedEvent): TemplateResult {
-    if (decoded.category === "button") {
-      const buttons = this._bucketWithPreserve(
-        this._objects?.buttons ?? null, "button", decoded.button ?? 0,
-      );
-      return html`
-        <label class="block">
-          Button
-          <select @change=${this._onEventButtonChange}>
-            ${buttons.map((b) => html`
-              <option .value=${String(b.index)}
-                      ?selected=${b.index === decoded.button}>
-                #${b.index} ${b.name}
-              </option>
-            `)}
-          </select>
-        </label>`;
-    }
-    if (decoded.category === "zone") {
-      const zones = this._bucketWithPreserve(
-        this._objects?.zones ?? null, "zone", decoded.zone ?? 0,
-      );
-      return html`
-        <label class="block">
-          Zone
-          <select @change=${this._onEventZoneChange}>
-            ${zones.map((z) => html`
-              <option .value=${String(z.index)}
-                      ?selected=${z.index === decoded.zone}>
-                #${z.index} ${z.name}
-              </option>
-            `)}
-          </select>
-        </label>
-        <label class="block">
-          Becomes
-          <select @change=${this._onEventZoneStateChange}>
-            <option value="0" ?selected=${decoded.zoneState === 0}>secure</option>
-            <option value="1" ?selected=${decoded.zoneState === 1}>not ready</option>
-          </select>
-        </label>`;
-    }
-    if (decoded.category === "unit") {
-      const units = this._bucketWithPreserve(
-        this._objects?.units ?? null, "unit", decoded.unit ?? 0,
-      );
-      return html`
-        <label class="block">
-          Unit
-          <select @change=${this._onEventUnitChange}>
-            ${units.map((u) => html`
-              <option .value=${String(u.index)}
-                      ?selected=${u.index === decoded.unit}>
-                #${u.index} ${u.name}
-              </option>
-            `)}
-          </select>
-        </label>
-        <label class="block">
-          Turns
-          <select @change=${this._onEventUnitOnChange}>
-            <option value="1" ?selected=${decoded.unitOn === true}>ON</option>
-            <option value="0" ?selected=${decoded.unitOn === false}>OFF</option>
-          </select>
-        </label>`;
-    }
-    if (decoded.category === "allunits") {
-      return html`
-        <label class="block">
-          Command
-          <select @change=${(e: Event) => this._patchEvent({
-            ...decoded,
-            allOn: (e.target as HTMLSelectElement).value === "1",
-          })}>
-            <option value="1" ?selected=${decoded.allOn === true}>All ON</option>
-            <option value="0" ?selected=${decoded.allOn !== true}>All OFF</option>
-          </select>
-        </label>
-        ${this._renderAreaSelect("In", decoded.area ?? 0, "any area",
-          (v) => this._patchEvent({ ...decoded, area: v }))}`;
-    }
-    if (decoded.category === "security") {
-      return html`
-        ${this._renderAreaSelect("Area", decoded.area ?? 0, "any area",
-          (v) => this._patchEvent({ ...decoded, area: v }))}
-        <label class="block">
-          Is set to
-          <select @change=${(e: Event) => this._patchEvent({
-            ...decoded,
-            mode: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            ${SECURITY_MODE_NAMES.map((m) => html`
-              <option .value=${String(m.value)}
-                      ?selected=${m.value === decoded.mode}>
-                ${m.label}
-              </option>`)}
-          </select>
-        </label>
-        ${decoded.code ? html`
+  private _renderEventFields(
+    decoded: DecodedEvent, setEvent: (e: DecodedEvent) => void,
+  ): TemplateResult {
+    switch (decoded.category) {
+      case "button":
+        return this._renderObjectSelect("Button", "button", decoded.button ?? 0,
+          (v) => setEvent({ category: "button", button: v }), 255);
+      case "zone":
+        return html`
+          ${this._renderObjectSelect("Zone", "zone", decoded.zone ?? 0,
+            (v) => setEvent({ ...decoded, zone: v }), 511)}
+          <label class="block">
+            Becomes
+            <select @change=${(e: Event) => setEvent({
+              ...decoded,
+              zoneState: (e.target as HTMLSelectElement).value === "1" ? 1 : 0,
+            })}>
+              <option value="0" ?selected=${decoded.zoneState === 0}>secure</option>
+              <option value="1" ?selected=${decoded.zoneState === 1}>not ready</option>
+            </select>
+          </label>`;
+      case "unit":
+        return html`
+          ${this._renderObjectSelect("Unit", "unit", decoded.unit ?? 0,
+            (v) => setEvent({ ...decoded, unit: v }), 511)}
+          <label class="block">
+            Turns
+            <select @change=${(e: Event) => setEvent({
+              ...decoded,
+              unitOn: (e.target as HTMLSelectElement).value === "1",
+            })}>
+              <option value="1" ?selected=${decoded.unitOn === true}>ON</option>
+              <option value="0" ?selected=${decoded.unitOn !== true}>OFF</option>
+            </select>
+          </label>`;
+      case "allunits":
+        return html`
+          <label class="block">
+            Command
+            <select @change=${(e: Event) => setEvent({
+              ...decoded,
+              allOn: (e.target as HTMLSelectElement).value === "1",
+            })}>
+              <option value="1" ?selected=${decoded.allOn === true}>All ON</option>
+              <option value="0" ?selected=${decoded.allOn !== true}>All OFF</option>
+            </select>
+          </label>
+          ${this._renderAreaSelect("In", decoded.area ?? 0, "any area",
+            (v) => setEvent({ ...decoded, area: v }))}`;
+      case "security":
+        return html`
+          ${this._renderAreaSelect("Area", decoded.area ?? 0, "any area",
+            (v) => setEvent({ ...decoded, area: v }))}
+          <label class="block">
+            Is set to
+            <select @change=${(e: Event) => setEvent({
+              ...decoded,
+              mode: parseInt((e.target as HTMLSelectElement).value, 10),
+            })}>
+              ${SECURITY_MODE_NAMES.map((m) => html`
+                <option .value=${String(m.value)}
+                        ?selected=${m.value === decoded.mode}>
+                  ${m.label}
+                </option>`)}
+            </select>
+          </label>
+          ${decoded.code ? html`
+            <div class="conditions-readonly">
+              Only when set by user code ${decoded.code} (kept as is).
+            </div>` : ""}`;
+      case "fixed":
+        return html`
+          <label class="block">
+            Event
+            <select @change=${(e: Event) => setEvent({
+              category: "fixed",
+              fixedId: parseInt((e.target as HTMLSelectElement).value, 10),
+            })}>
+              ${FIXED_EVENTS.map((f) => html`
+                <option .value=${String(f.id)}
+                        ?selected=${f.id === decoded.fixedId}>
+                  ${f.label}
+                </option>`)}
+            </select>
+          </label>`;
+      default:
+        return html`
           <div class="conditions-readonly">
-            Only when set by user code ${decoded.code} (kept as is).
-          </div>` : ""}`;
+            This editor doesn't know this event. It is kept exactly as it
+            is unless you pick another category.
+          </div>`;
     }
-    if (decoded.category === "fixed") {
-      return html`
-        <label class="block">
-          Event
-          <select @change=${this._onEventFixedChange}>
-            ${FIXED_EVENTS.map((f) => html`
-              <option .value=${String(f.id)}
-                      ?selected=${f.id === decoded.fixedId}>
-                ${f.label}
-              </option>
-            `)}
-          </select>
-        </label>`;
-    }
-    // raw — render as informational; the user picked another category
-    // from the dropdown if they want to change it.
-    return html`
-      <div class="conditions-readonly">
-        Unrecognised event ID. Switch category above to redefine.
-      </div>`;
   }
 
   private _renderYearlyTrigger(draft: ProgramFields): TemplateResult {
@@ -1448,37 +1431,53 @@ export class OmniPanelPrograms extends LitElement {
   }
 
   private _renderActionSection(draft: ProgramFields): TemplateResult {
-    const cmd = draft.cmd ?? 0;
-    const opt: CommandOption | undefined = commandOptionFor(cmd);
     return html`
       <fieldset>
         <legend>Action</legend>
-        <label class="block">
-          Command
-          <select @change=${this._onCommandChange}>
-            ${opt ? "" : html`
-              <option .value=${String(cmd)} selected>
-                Command ${cmd} (kept as is)
-              </option>`}
-            ${COMMAND_OPTIONS.map((c) => html`
-              <option .value=${String(c.value)}
-                      ?selected=${c.value === cmd}>
-                ${c.label}
-              </option>
-            `)}
-          </select>
-        </label>
-        ${opt ? this._renderActionFields(draft, opt) : html`
-          <div class="conditions-readonly">
-            This editor doesn't know this action. It is kept exactly as it
-            is unless you pick another command.
-          </div>`}
+        ${this._renderActionForm(draft, (p) => this._patchDraft(p))}
       </fieldset>
+    `;
+  }
+
+  /** Command picker plus the inputs that command needs. Shared by
+   *  single-line programs and the THEN lines of a multi-line one. */
+  private _renderActionForm(
+    fields: ProgramFields, patch: (p: Partial<ProgramFields>) => void,
+  ): TemplateResult {
+    const cmd = fields.cmd ?? 0;
+    const opt: CommandOption | undefined = commandOptionFor(cmd);
+    return html`
+      <label class="block">
+        Command
+        <select @change=${(e: Event) => {
+          const value = parseInt((e.target as HTMLSelectElement).value, 10);
+          const change = Number.isFinite(value)
+            ? this._commandPatch(fields, value) : null;
+          if (change) patch(change);
+        }}>
+          ${opt ? "" : html`
+            <option .value=${String(cmd)} selected>
+              Command ${cmd} (kept as is)
+            </option>`}
+          ${COMMAND_OPTIONS.map((c) => html`
+            <option .value=${String(c.value)}
+                    ?selected=${c.value === cmd}>
+              ${c.label}
+            </option>
+          `)}
+        </select>
+      </label>
+      ${opt ? this._renderActionFields(fields, opt, patch) : html`
+        <div class="conditions-readonly">
+          This editor doesn't know this action. It is kept exactly as it
+          is unless you pick another command.
+        </div>`}
     `;
   }
 
   private _renderActionFields(
     draft: ProgramFields, opt: CommandOption,
+    patch: (p: Partial<ProgramFields>) => void,
   ): TemplateResult {
     const par = draft.par ?? 0;
     const pr2 = draft.pr2 ?? 0;
@@ -1500,38 +1499,38 @@ export class OmniPanelPrograms extends LitElement {
     switch (opt.form) {
       case "unit":
         return html`
-          ${this._renderObjectSelect("Unit", "unit", pr2, (v) => this._patchDraft({ pr2: v }))}
-          ${this._renderDuration(par)}`;
+          ${this._renderObjectSelect("Unit", "unit", pr2, (v) => patch({ pr2: v }))}
+          ${this._renderDuration(par, patch)}`;
       case "level":
         return html`
-          ${this._renderObjectSelect("Unit", "unit", pr2, (v) => this._patchDraft({ pr2: v }))}
-          ${numberInput("Level (0..100)", par, 0, 100, (v) => this._patchDraft({ par: v }))}`;
+          ${this._renderObjectSelect("Unit", "unit", pr2, (v) => patch({ pr2: v }))}
+          ${numberInput("Level (0..100)", par, 0, 100, (v) => patch({ par: v }))}`;
       case "timed-level": {
         // pr2 packs the level (high byte) and the unit (low byte).
         const unit = pr2 & 0xFF;
         const level = (pr2 >> 8) & 0xFF;
         return html`
           ${this._renderObjectSelect("Unit", "unit", unit,
-            (v) => this._patchDraft({ pr2: (level << 8) | (v & 0xFF) }), 255)}
+            (v) => patch({ pr2: (level << 8) | (v & 0xFF) }), 255)}
           ${numberInput("Level (0..100)", level, 0, 100,
-            (v) => this._patchDraft({ pr2: (v << 8) | unit }))}
-          ${this._renderDuration(par)}`;
+            (v) => patch({ pr2: (v << 8) | unit }))}
+          ${this._renderDuration(par, patch)}`;
       }
       case "all":
         return this._renderAreaSelect(
-          "In", pr2, "every area", (v) => this._patchDraft({ pr2: v }));
+          "In", pr2, "every area", (v) => patch({ pr2: v }));
       case "zone":
         return this._renderObjectSelect(
-          "Zone", "zone", pr2, (v) => this._patchDraft({ pr2: v }));
+          "Zone", "zone", pr2, (v) => patch({ pr2: v }));
       case "button":
         return this._renderObjectSelect(
-          "Button", "button", pr2, (v) => this._patchDraft({ pr2: v }));
+          "Button", "button", pr2, (v) => patch({ pr2: v }));
       case "area":
         return this._renderObjectSelect(
-          "Area", "area", pr2, (v) => this._patchDraft({ pr2: v }));
+          "Area", "area", pr2, (v) => patch({ pr2: v }));
       case "link":
         return numberInput("UPB link number", pr2, 1, 250,
-          (v) => this._patchDraft({ pr2: v }));
+          (v) => patch({ pr2: v }));
       case "setpoint": {
         const thermostats: NamedObject[] = [
           { index: 0, name: "all thermostats" },
@@ -1543,7 +1542,7 @@ export class OmniPanelPrograms extends LitElement {
             Thermostat
             <select @change=${(e: Event) => {
               const v = parseInt((e.target as HTMLSelectElement).value, 10);
-              if (Number.isFinite(v)) this._patchDraft({ pr2: v });
+              if (Number.isFinite(v)) patch({ pr2: v });
             }}>
               ${thermostats.map((t) => html`
                 <option .value=${String(t.index)} ?selected=${t.index === pr2}>
@@ -1552,7 +1551,7 @@ export class OmniPanelPrograms extends LitElement {
             </select>
           </label>
           ${numberInput("Temperature (°F)", rawTempToF(par), -40, 189,
-            (v) => this._patchDraft({ par: fToRawTemp(v) }))}`;
+            (v) => patch({ par: fToRawTemp(v) }))}`;
       }
     }
   }
@@ -1607,7 +1606,9 @@ export class OmniPanelPrograms extends LitElement {
   }
 
   /** "For <n> seconds / minutes / hours" or "until changed". */
-  private _renderDuration(par: number): TemplateResult {
+  private _renderDuration(
+    par: number, patch: (p: Partial<ProgramFields>) => void,
+  ): TemplateResult {
     const d = decodeDuration(par);
     const timed = d.unit === "sec" || d.unit === "min" || d.unit === "hr";
     return html`
@@ -1621,14 +1622,14 @@ export class OmniPanelPrograms extends LitElement {
               @input=${(e: Event) => {
                 const v = parseInt((e.target as HTMLInputElement).value, 10);
                 if (Number.isFinite(v) && v >= 1) {
-                  this._patchDraft({ par: encodeDuration({ unit: d.unit, value: v }) });
+                  patch({ par: encodeDuration({ unit: d.unit, value: v }) });
                 }
               }}
             />` : ""}
           <select @change=${(e: Event) => {
             const unit = (e.target as HTMLSelectElement).value as DurationUnit;
             if (unit === "raw") return;
-            this._patchDraft({
+            patch({
               par: encodeDuration({ unit, value: timed ? d.value : 1 }),
             });
           }}>
@@ -1661,6 +1662,7 @@ export class OmniPanelPrograms extends LitElement {
 
   private _renderConditionSlot(
     label: string, raw: number, onChange: (newCond: number) => void,
+    allowNone = true,
   ): TemplateResult {
     const decoded = decodeCondition(raw);
     const setFamily = (family: CondFamily) => {
@@ -1687,7 +1689,8 @@ export class OmniPanelPrograms extends LitElement {
           ${label}
           <select @change=${(e: Event) =>
             setFamily((e.target as HTMLSelectElement).value as CondFamily)}>
-            <option value="none" ?selected=${decoded.family === "none"}>(none)</option>
+            ${allowNone || decoded.family === "none" ? html`
+              <option value="none" ?selected=${decoded.family === "none"}>(none)</option>` : ""}
             <option value="zone" ?selected=${decoded.family === "zone"}>Zone state</option>
             <option value="unit" ?selected=${decoded.family === "unit"}>Unit state</option>
             <option value="sec"  ?selected=${decoded.family === "sec"}>Area in security mode</option>
@@ -1864,7 +1867,7 @@ export class OmniPanelPrograms extends LitElement {
             <span class="trigger-badge trigger-${d.trigger_type.toLowerCase()}">
               EDIT • ${d.trigger_type}
             </span>
-            <span class="slot">head @ slot #${draft.headSlot}</span>
+            <span class="slot">slot #${draft.headSlot}</span>
           </div>
           <button type="button" class="close" @click=${this._cancelChainEdit}>×</button>
         </header>
@@ -1874,15 +1877,19 @@ export class OmniPanelPrograms extends LitElement {
           ${this._renderChainConditionsSection(draft.conditions)}
           ${this._renderChainActionsSection(draft.actions)}
           <div class="chain-meta">
-            Chain will occupy <strong>${1 + draft.conditions.length + draft.actions.length}</strong>
-            consecutive slots starting at #${draft.headSlot}.
+            ${this._chainSlotNote(d, draft)}
           </div>
         </div>
 
         <footer>
-          <button type="button" class="primary" @click=${this._saveChainDraft}>
-            Save chain
+          <button type="button" class="primary" @click=${() => this._saveChainDraft()}>
+            Save
           </button>
+          ${this._relocateOffer ? html`
+            <button type="button" class="secondary"
+                    @click=${() => this._saveChainDraft(true)}>
+              Move it there and save
+            </button>` : ""}
           <button type="button" class="secondary" @click=${this._cancelChainEdit}>
             Cancel
           </button>
@@ -1915,197 +1922,17 @@ export class OmniPanelPrograms extends LitElement {
   }
 
   private _renderTimedTriggerChain(head: ProgramFields): TemplateResult {
-    // Same fields as TIMED compact: hour/minute/days.
-    return html`
-      <fieldset>
-        <legend>AT (trigger)</legend>
-        <div class="row">
-          <label>
-            Hour
-            <input type="number" min="0" max="23"
-              .value=${String(head.hour ?? 0)}
-              @input=${(e: Event) => this._patchChainHead({
-                hour: parseInt((e.target as HTMLInputElement).value, 10) || 0,
-              })}
-            />
-          </label>
-          <span class="time-colon">:</span>
-          <label>
-            Minute
-            <input type="number" min="0" max="59"
-              .value=${String(head.minute ?? 0)}
-              @input=${(e: Event) => this._patchChainHead({
-                minute: parseInt((e.target as HTMLInputElement).value, 10) || 0,
-              })}
-            />
-          </label>
-        </div>
-        <div class="days-row">
-          ${DAY_BITS.map((d) => {
-            const active = ((head.days ?? 0) & d.bit) !== 0;
-            return html`
-              <button type="button"
-                class="day-toggle ${active ? "active" : ""}"
-                @click=${() => this._patchChainHead({
-                  days: (head.days ?? 0) ^ d.bit,
-                })}
-              >${d.label}</button>`;
-          })}
-        </div>
-      </fieldset>
-    `;
+    return this._renderTimeEditor("AT (trigger)", head, (p) => this._patchChainHead(p));
   }
 
   private _renderEventTriggerChain(head: ProgramFields): TemplateResult {
-    // WHEN heads use the same event-id packing as EVENT compact-form:
-    // month/day bytes carry (event_id >> 8) and (event_id & 0xFF).
-    const eventId = ((head.month ?? 0) << 8) | (head.day ?? 0);
-    const decoded = decodeEventId(eventId);
-    const setEvent = (e: DecodedEvent) => {
-      const id = encodeEventId(e);
-      this._patchChainHead({
-        month: (id >> 8) & 0xFF,
-        day: id & 0xFF,
-      });
-    };
-    return html`
-      <fieldset>
-        <legend>WHEN (trigger event)</legend>
-        <label class="block">
-          Category
-          <select @change=${(e: Event) => {
-            const cat = (e.target as HTMLSelectElement).value as EventCategory;
-            if (cat === "button") {
-              const fb = this._objects?.buttons?.[0]?.index ?? 1;
-              setEvent({ category: "button", button: fb });
-            } else if (cat === "zone") {
-              const fz = this._objects?.zones?.[0]?.index ?? 1;
-              setEvent({ category: "zone", zone: fz, zoneState: 1 });
-            } else if (cat === "unit") {
-              const fu = this._objects?.units?.[0]?.index ?? 1;
-              setEvent({ category: "unit", unit: fu, unitOn: true });
-            } else if (cat === "fixed") {
-              setEvent({ category: "fixed", fixedId: 772 });
-            }
-          }}>
-            <option value="button" ?selected=${decoded.category === "button"}>Button press</option>
-            <option value="zone" ?selected=${decoded.category === "zone"}>Zone state change</option>
-            <option value="unit" ?selected=${decoded.category === "unit"}>Unit state change</option>
-            <option value="fixed" ?selected=${decoded.category === "fixed"}>Fixed (phone / AC)</option>
-            ${decoded.category === "raw" ? html`
-              <option value="raw" selected>Raw 0x${eventId.toString(16).padStart(4, "0")}</option>` : ""}
-          </select>
-        </label>
-        ${this._renderChainEventSubfields(decoded, setEvent)}
-      </fieldset>
-    `;
-  }
-
-  private _renderChainEventSubfields(
-    decoded: DecodedEvent, setEvent: (e: DecodedEvent) => void,
-  ): TemplateResult {
-    if (decoded.category === "button") {
-      const buttons = this._bucketWithPreserve(
-        this._objects?.buttons ?? null, "button", decoded.button ?? 0,
-      );
-      return html`
-        <label class="block">
-          Button
-          <select @change=${(e: Event) => setEvent({
-            category: "button",
-            button: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            ${buttons.map((b) => html`
-              <option .value=${String(b.index)}
-                      ?selected=${b.index === decoded.button}>
-                #${b.index} ${b.name}
-              </option>
-            `)}
-          </select>
-        </label>`;
-    }
-    if (decoded.category === "zone") {
-      const zones = this._bucketWithPreserve(
-        this._objects?.zones ?? null, "zone", decoded.zone ?? 0,
-      );
-      return html`
-        <label class="block">
-          Zone
-          <select @change=${(e: Event) => setEvent({
-            ...decoded, category: "zone",
-            zone: parseInt((e.target as HTMLSelectElement).value, 10),
-            zoneState: decoded.zoneState ?? 1,
-          })}>
-            ${zones.map((z) => html`
-              <option .value=${String(z.index)}
-                      ?selected=${z.index === decoded.zone}>
-                #${z.index} ${z.name}
-              </option>
-            `)}
-          </select>
-        </label>
-        <label class="block">
-          Becomes
-          <select @change=${(e: Event) => setEvent({
-            ...decoded, category: "zone",
-            zone: decoded.zone ?? 1,
-            zoneState: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            <option value="0" ?selected=${decoded.zoneState === 0}>secure</option>
-            <option value="1" ?selected=${decoded.zoneState === 1}>not ready</option>
-          </select>
-        </label>`;
-    }
-    if (decoded.category === "unit") {
-      const units = this._bucketWithPreserve(
-        this._objects?.units ?? null, "unit", decoded.unit ?? 0,
-      );
-      return html`
-        <label class="block">
-          Unit
-          <select @change=${(e: Event) => setEvent({
-            ...decoded, category: "unit",
-            unit: parseInt((e.target as HTMLSelectElement).value, 10),
-            unitOn: decoded.unitOn ?? true,
-          })}>
-            ${units.map((u) => html`
-              <option .value=${String(u.index)}
-                      ?selected=${u.index === decoded.unit}>
-                #${u.index} ${u.name}
-              </option>
-            `)}
-          </select>
-        </label>
-        <label class="block">
-          Turns
-          <select @change=${(e: Event) => setEvent({
-            ...decoded, category: "unit",
-            unit: decoded.unit ?? 1,
-            unitOn: (e.target as HTMLSelectElement).value === "1",
-          })}>
-            <option value="1" ?selected=${decoded.unitOn === true}>ON</option>
-            <option value="0" ?selected=${decoded.unitOn === false}>OFF</option>
-          </select>
-        </label>`;
-    }
-    if (decoded.category === "fixed") {
-      return html`
-        <label class="block">
-          Event
-          <select @change=${(e: Event) => setEvent({
-            category: "fixed",
-            fixedId: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            ${FIXED_EVENTS.map((f) => html`
-              <option .value=${String(f.id)}
-                      ?selected=${f.id === decoded.fixedId}>
-                ${f.label}
-              </option>
-            `)}
-          </select>
-        </label>`;
-    }
-    return html`<div class="conditions-readonly">Unrecognised event ID. Pick a category to redefine.</div>`;
+    // WHEN lines pack the event the same way single-line EVENT programs
+    // do: month/day carry (event_id >> 8) and (event_id & 0xFF).
+    return this._renderEventEditor(
+      "WHEN (trigger event)", eventIdFromFields(head),
+      (e) => this._patchChainHead(
+        packEventIdIntoFields(head, encodeEventId(e))),
+    );
   }
 
   private _renderEveryTriggerChain(head: ProgramFields): TemplateResult {
@@ -2163,7 +1990,6 @@ export class OmniPanelPrograms extends LitElement {
     if (isStructuredAnd(cond)) {
       return this._renderStructuredChainConditionRow(cond, idx, isOr);
     }
-    const decoded = decodeAndCondition(cond);
     return html`
       <div class="cond-slot">
         <div class="cond-row-header">
@@ -2171,7 +1997,14 @@ export class OmniPanelPrograms extends LitElement {
           <button type="button" class="mini-btn danger"
             @click=${() => this._removeChainCondition(idx)}>×</button>
         </div>
-        ${this._renderChainCondFamily(decoded, idx)}
+        ${this._renderConditionSlot(
+          "", andConditionWord(cond),
+          (word) => this._patchChainCondition(idx, {
+            cond: (word >> 8) & 0xFF,
+            cond2: (word & 0xFF) << 8,
+          }),
+          false,
+        )}
       </div>`;
   }
 
@@ -2179,7 +2012,7 @@ export class OmniPanelPrograms extends LitElement {
     cond: ProgramFields, idx: number, isOr: boolean,
   ): TemplateResult {
     const s = decodeStructuredAnd(cond);
-    if (!isEditableStructuredAnd(s)) {
+    if (!STRUCTURED_EDIT_ENABLED || !isEditableStructuredAnd(s)) {
       // Out of editor scope (unsupported Arg1/Arg2 type or non-zero
       // CompConst). Surface as preserve-only so the user can still
       // remove the row but can't damage the encoded data.
@@ -2192,9 +2025,8 @@ export class OmniPanelPrograms extends LitElement {
               @click=${() => this._removeChainCondition(idx)}>×</button>
           </div>
           <div class="conditions-readonly">
-            Structured comparison with a shape the editor can't drive
-            yet (Arg1 or Arg2 is an unsupported type, or a CompConst
-            value is present). Preserved on save.
+            A comparison (for example "temperature is above 70"). This
+            editor doesn't change these yet; it is kept exactly as it is.
           </div>
         </div>`;
     }
@@ -2376,166 +2208,6 @@ export class OmniPanelPrograms extends LitElement {
       </label>`;
   }
 
-  private _renderChainCondFamily(
-    decoded: DecodedCondition, idx: number,
-  ): TemplateResult {
-    const setFamily = (family: CondFamily) => {
-      const firstZone = this._objects?.zones?.[0]?.index ?? 1;
-      const firstUnit = this._objects?.units?.[0]?.index ?? 1;
-      const firstArea = this._objects?.areas?.[0]?.index ?? 1;
-      let next: DecodedCondition;
-      switch (family) {
-        case "none":  next = { family: "none" }; break;
-        case "misc":  next = { family: "misc", misc: 1 }; break;
-        case "zone":  next = { family: "zone", index: firstZone, active: false }; break;
-        case "unit":  next = { family: "unit", index: firstUnit, active: true }; break;
-        case "time":  next = { family: "time", index: 1, active: true }; break;
-        case "sec":   next = { family: "sec", index: firstArea, mode: 0 }; break;
-        case "raw":   return;  // not selectable; shown only for existing values
-      }
-      const enc = encodeAndCondition(next);
-      this._patchChainCondition(idx, enc);
-    };
-    const setDecoded = (next: DecodedCondition) => {
-      this._patchChainCondition(idx, encodeAndCondition(next));
-    };
-    return html`
-      <label class="block">
-        Family
-        <select @change=${(e: Event) =>
-          setFamily((e.target as HTMLSelectElement).value as CondFamily)}>
-          <option value="zone" ?selected=${decoded.family === "zone"}>Zone state</option>
-          <option value="unit" ?selected=${decoded.family === "unit"}>Unit state</option>
-          <option value="sec"  ?selected=${decoded.family === "sec"}>Area in security mode</option>
-          <option value="time" ?selected=${decoded.family === "time"}>Time clock</option>
-          <option value="misc" ?selected=${decoded.family === "misc"}>Misc</option>
-        </select>
-      </label>
-      ${this._renderChainCondSubfields(decoded, setDecoded)}
-    `;
-  }
-
-  private _renderChainCondSubfields(
-    decoded: DecodedCondition, setDecoded: (d: DecodedCondition) => void,
-  ): TemplateResult {
-    if (decoded.family === "zone") {
-      const zones = this._bucketWithPreserve(
-        this._objects?.zones ?? null, "zone", decoded.index ?? 0,
-      );
-      return html`
-        <label class="block">
-          Zone
-          <select @change=${(e: Event) => setDecoded({
-            ...decoded, index: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            ${zones.map((z) => html`
-              <option .value=${String(z.index)} ?selected=${z.index === decoded.index}>
-                #${z.index} ${z.name}
-              </option>`)}
-          </select>
-        </label>
-        <label class="block">
-          Is
-          <select @change=${(e: Event) => setDecoded({
-            ...decoded, active: (e.target as HTMLSelectElement).value === "1",
-          })}>
-            <option value="0" ?selected=${!decoded.active}>secure</option>
-            <option value="1" ?selected=${decoded.active}>not ready</option>
-          </select>
-        </label>`;
-    }
-    if (decoded.family === "unit") {
-      const units = this._bucketWithPreserve(
-        this._objects?.units ?? null, "unit", decoded.index ?? 0,
-      );
-      return html`
-        <label class="block">
-          Unit
-          <select @change=${(e: Event) => setDecoded({
-            ...decoded, index: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            ${units.map((u) => html`
-              <option .value=${String(u.index)} ?selected=${u.index === decoded.index}>
-                #${u.index} ${u.name}
-              </option>`)}
-          </select>
-        </label>
-        <label class="block">
-          Is
-          <select @change=${(e: Event) => setDecoded({
-            ...decoded, active: (e.target as HTMLSelectElement).value === "1",
-          })}>
-            <option value="1" ?selected=${decoded.active}>ON</option>
-            <option value="0" ?selected=${!decoded.active}>OFF</option>
-          </select>
-        </label>`;
-    }
-    if (decoded.family === "sec") {
-      const areas = this._bucketWithPreserve(
-        this._objects?.areas ?? null, "area", decoded.index ?? 0,
-      );
-      return html`
-        <label class="block">
-          Area
-          <select @change=${(e: Event) => setDecoded({
-            ...decoded, index: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            ${areas.map((a) => html`
-              <option .value=${String(a.index)} ?selected=${a.index === decoded.index}>
-                #${a.index} ${a.name}
-              </option>`)}
-          </select>
-        </label>
-        <label class="block">
-          Mode
-          <select @change=${(e: Event) => setDecoded({
-            ...decoded, mode: parseInt((e.target as HTMLSelectElement).value, 10),
-          })}>
-            ${SECURITY_MODE_NAMES.map((m) => html`
-              <option .value=${String(m.value)} ?selected=${m.value === decoded.mode}>
-                ${m.label}
-              </option>`)}
-          </select>
-        </label>`;
-    }
-    if (decoded.family === "time") {
-      return html`
-        <label class="block">
-          Time clock # (1..3)
-          <input type="number" min="1" max="3"
-            .value=${String(decoded.index ?? 1)}
-            @input=${(e: Event) => {
-              const idx = parseInt((e.target as HTMLInputElement).value, 10);
-              if (Number.isFinite(idx)) setDecoded({ ...decoded, index: idx });
-            }}
-          />
-        </label>
-        <label class="block">
-          Is
-          <select @change=${(e: Event) => setDecoded({
-            ...decoded, active: (e.target as HTMLSelectElement).value === "1",
-          })}>
-            <option value="1" ?selected=${decoded.active}>enabled</option>
-            <option value="0" ?selected=${!decoded.active}>disabled</option>
-          </select>
-        </label>`;
-    }
-    // misc
-    return html`
-      <label class="block">
-        Condition
-        <select @change=${(e: Event) => setDecoded({
-          family: "misc",
-          misc: parseInt((e.target as HTMLSelectElement).value, 10),
-        })}>
-          ${MISC_CONDITIONALS.map((m) => html`
-            <option .value=${String(m.value)} ?selected=${m.value === decoded.misc}>
-              ${m.label}
-            </option>`)}
-        </select>
-      </label>`;
-  }
-
   private _renderChainActionsSection(actions: ProgramFields[]): TemplateResult {
     return html`
       <fieldset>
@@ -2552,15 +2224,6 @@ export class OmniPanelPrograms extends LitElement {
   private _renderChainActionRow(
     action: ProgramFields, idx: number, total: number,
   ): TemplateResult {
-    const cmdOpt: CommandOption | undefined = commandOptionFor(action.cmd ?? 0);
-    const objectBucket = cmdOpt?.ref_kind
-      ? this._bucketWithPreserve(
-          this._pickBucket(cmdOpt.ref_kind),
-          cmdOpt.ref_kind,
-          action.pr2 ?? 0,
-        )
-      : null;
-    const showsLevelPercent = action.cmd === 9;
     return html`
       <div class="cond-slot">
         <div class="cond-row-header">
@@ -2569,55 +2232,7 @@ export class OmniPanelPrograms extends LitElement {
             <button type="button" class="mini-btn danger"
               @click=${() => this._removeChainAction(idx)}>×</button>` : ""}
         </div>
-        <label class="block">
-          Command
-          <select @change=${(e: Event) => {
-            const value = parseInt((e.target as HTMLSelectElement).value, 10);
-            const opt = commandOptionFor(value);
-            let newPr2 = action.pr2 ?? 0;
-            if (opt?.ref_kind && this._objects) {
-              const bucket = this._pickBucket(opt.ref_kind);
-              if (bucket && bucket.length > 0 &&
-                  !bucket.some((o) => o.index === newPr2)) {
-                newPr2 = bucket[0].index;
-              }
-            } else if (!opt?.ref_kind) {
-              newPr2 = 0;
-            }
-            this._patchChainAction(idx, { cmd: value, pr2: newPr2 });
-          }}>
-            ${COMMAND_OPTIONS.map((c) => html`
-              <option .value=${String(c.value)} ?selected=${c.value === action.cmd}>
-                ${c.label}
-              </option>`)}
-          </select>
-        </label>
-        ${cmdOpt?.ref_kind ? html`
-          <label class="block">
-            ${cmdOpt.ref_kind[0].toUpperCase() + cmdOpt.ref_kind.slice(1)}
-            <select @change=${(e: Event) => {
-              const v = parseInt((e.target as HTMLSelectElement).value, 10);
-              if (Number.isFinite(v)) this._patchChainAction(idx, { pr2: v });
-            }}>
-              ${(objectBucket ?? []).map((o) => html`
-                <option .value=${String(o.index)} ?selected=${o.index === action.pr2}>
-                  #${o.index} ${o.name}
-                </option>`)}
-            </select>
-          </label>` : ""}
-        ${showsLevelPercent ? html`
-          <label class="block">
-            Level (0..100)
-            <input type="number" min="0" max="100"
-              .value=${String(action.par ?? 0)}
-              @input=${(e: Event) => {
-                const v = parseInt((e.target as HTMLInputElement).value, 10);
-                if (Number.isFinite(v) && v >= 0 && v <= 100) {
-                  this._patchChainAction(idx, { par: v });
-                }
-              }}
-            />
-          </label>` : ""}
+        ${this._renderActionForm(action, (p) => this._patchChainAction(idx, p))}
       </div>
     `;
   }
@@ -2885,9 +2500,14 @@ export class OmniPanelPrograms extends LitElement {
       border-radius: 4px;
       font-size: 0.88rem;
     }
-    .action-row.danger-row {
-      background: var(--error-color, #db4437);
-      color: white;
+    .action-row.confirm-row {
+      flex-wrap: wrap;
+      border-left: 4px solid var(--error-color, #db4437);
+    }
+    .confirm-text { flex-basis: 100%; line-height: 1.4; }
+    .danger-solid {
+      background: var(--error-color, #db4437); color: #fff;
+      border: none; border-radius: 4px; cursor: pointer;
     }
     .action-row input[type="number"] {
       width: 70px;

@@ -603,19 +603,22 @@ async def test_ws_chain_write_shrinks_and_clears(
 
 
 async def test_ws_chain_write_refuses_to_trample(
-    hass: HomeAssistant, configured_panel, hass_ws_client
+    hass: HomeAssistant, configured_panel, hass_ws_client, panel
 ) -> None:
     """Expanding a chain into a slot that already holds another program
     is refused — protects against accidental data loss."""
     client = await hass_ws_client(hass)
     coordinator = hass.data[DOMAIN][configured_panel.entry_id]
     # Seed a sentinel program at slot 204 (right after the chain) so an
-    # expand attempt collides.
-    coordinator.data.programs[204] = Program(
+    # expand attempt collides. It goes on the panel as well as in the
+    # cached table: the write path checks the panel itself.
+    sentinel = Program(
         slot=204, prog_type=int(ProgramType.TIMED),
         cmd=int(Command.UNIT_ON), pr2=1,
         hour=12, minute=0, days=int(Days.MONDAY),
     )
+    coordinator.data.programs[204] = sentinel
+    panel[0].state.programs[204] = sentinel.encode_wire_bytes()
     await client.send_json_auto_id({
         "type": "omni_pca/programs/chain/write",
         "entry_id": configured_panel.entry_id,
@@ -639,9 +642,10 @@ async def test_ws_chain_write_refuses_to_trample(
     })
     response = await client.receive_json()
     assert response["success"] is False
-    assert response["error"]["code"] == "invalid"
+    assert response["error"]["code"] == "no_room"
     # The sentinel program is untouched.
     assert coordinator.data.programs[204].cmd == int(Command.UNIT_ON)
+    assert panel[0].state.programs[204] == sentinel.encode_wire_bytes()
 
 
 async def test_ws_chain_write_rejects_zero_actions(

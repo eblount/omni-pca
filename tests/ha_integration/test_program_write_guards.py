@@ -36,7 +36,7 @@ def _fields(hass, entry, slot: int) -> dict:
 
 def test_shipped_switches() -> None:
     assert const.PROGRAM_WRITES_ENABLED is True
-    assert const.PROGRAM_CHAIN_WRITES_ENABLED is False
+    assert const.PROGRAM_CHAIN_WRITES_ENABLED is True
     assert const.PROGRAM_FIRE_ENABLED is False
 
 
@@ -48,22 +48,41 @@ async def test_list_reports_what_is_enabled(
     )
     result = response["result"]
     assert result["can_write"] is True
-    assert result["can_edit_chains"] is False
+    assert result["can_edit_chains"] is True
     assert result["can_fire"] is False
+
+
+async def test_fire_is_refused(
+    hass: HomeAssistant, configured_panel, hass_ws_client, panel
+) -> None:
+    mock = panel[0]
+    before = dict(mock.state.programs)
+    response = await _call(hass, hass_ws_client, configured_panel, {
+        "type": "omni_pca/programs/fire", "slot": 12,
+    })
+    assert response["success"] is False
+    assert response["error"]["code"] == "read_only"
+    assert mock.state.programs == before
 
 
 @pytest.mark.parametrize(
     "command",
     [
-        {"type": "omni_pca/programs/fire", "slot": 12},
-        {"type": "omni_pca/programs/chain/write", "head_slot": 300,
+        {"type": "omni_pca/programs/chain/write", "head_slot": 30,
          "head": {"prog_type": 5}, "conditions": [],
          "actions": [{"prog_type": 10}]},
+        {"type": "omni_pca/programs/chain/clear", "head_slot": 30},
+        {"type": "omni_pca/programs/chain/clone", "source_slot": 30,
+         "target_slot": 300},
     ],
 )
-async def test_fire_and_block_edits_are_refused(
-    hass: HomeAssistant, configured_panel, hass_ws_client, panel, command: dict
+async def test_block_edits_are_refused_when_switched_off(
+    hass: HomeAssistant, panel, block_on_panel, configured_panel, hass_ws_client,
+    monkeypatch, command: dict,
 ) -> None:
+    monkeypatch.setattr(
+        "custom_components.omni_pca.websocket.PROGRAM_CHAIN_WRITES_ENABLED", False
+    )
     mock = panel[0]
     before = dict(mock.state.programs)
     response = await _call(hass, hass_ws_client, configured_panel, command)

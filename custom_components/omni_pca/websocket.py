@@ -496,10 +496,12 @@ async def _apply_change(
 ) -> dict[str, Any] | None:
     """Apply a journalled change; on failure send the error and return None."""
     try:
-        return await async_get_program_changes(hass, coordinator).async_apply(
+        entry = await async_get_program_changes(hass, coordinator).async_apply(
             action, changes, user_id=connection.user.id,
             expect_before=expect_before,
         )
+        # None means the panel already held exactly this: still a success.
+        return entry if entry is not None else {"id": None, "changes": []}
     except ProgramChangeError as err:
         message = conflict_message if err.code == "conflict" and conflict_message else str(err)
         connection.send_error(
@@ -551,6 +553,98 @@ _PROGRAM_FIELD_SCHEMA = vol.Schema(
 )
 
 
+_BLOCK_HEAD_TYPES: frozenset[int] = frozenset({
+    int(ProgramType.WHEN), int(ProgramType.AT), int(ProgramType.EVERY),
+})
+_BLOCK_CONDITION_TYPES: frozenset[int] = frozenset({
+    int(ProgramType.AND), int(ProgramType.OR),
+})
+_BLOCK_BODY_TYPES: frozenset[int] = _BLOCK_CONDITION_TYPES | {int(ProgramType.THEN)}
+
+
+async def _read_block(
+    hass: HomeAssistant,
+    coordinator: "OmniDataUpdateCoordinator",
+    head_slot: int,
+) -> list[Program]:
+    """Read the multi-line block starting at ``head_slot`` from the panel.
+
+    Returns its records in slot order, or an empty list if that slot
+    does not hold a block's first line. The panel is the authority here,
+    not the cached table.
+    """
+    changes = async_get_program_changes(hass, coordinator)
+    head = await changes.async_read(head_slot)
+    if head is None or head.prog_type not in _BLOCK_HEAD_TYPES:
+        return []
+    block = [head]
+    slot = head_slot + 1
+    while slot <= 1500:
+        record = await changes.async_read(slot)
+        if record is None or record.prog_type not in _BLOCK_BODY_TYPES:
+            break
+        block.append(record)
+        slot += 1
+    return block
+
+
+async def _first_free_run(
+    hass: HomeAssistant, coordinator: "OmniDataUpdateCoordinator", length: int,
+) -> int | None:
+    """First slot of ``length`` free slots after everything in use."""
+    programs = coordinator.data.programs if coordinator.data else {}
+    start = _next_free_slot(programs)
+    if start is None or start + length - 1 > 1500:
+        return None
+    changes = async_get_program_changes(hass, coordinator)
+    for slot in range(start, start + length):
+        if await changes.async_read(slot) is not None:
+            return None
+    return start
+
+
+def _block_records(
+    msg: dict[str, Any],
+) -> tuple[Program, list[Program], list[Program]]:
+    """Validate a block payload; raises ``vol.Invalid`` with a clear message."""
+    head = Program(**_PROGRAM_FIELD_SCHEMA(msg["head"]))
+    conditions = [Program(**_PROGRAM_FIELD_SCHEMA(c)) for c in msg["conditions"]]
+    actions = [Program(**_PROGRAM_FIELD_SCHEMA(a)) for a in msg["actions"]]
+    if head.prog_type not in _BLOCK_HEAD_TYPES:
+        raise vol.Invalid("the first line must be a WHEN, AT or EVERY record")
+    if any(c.prog_type not in _BLOCK_CONDITION_TYPES for c in conditions):
+        raise vol.Invalid("conditions must be AND or OR records")
+    if any(a.prog_type != int(ProgramType.THEN) for a in actions):
+        raise vol.Invalid("actions must be THEN records")
+    if not actions:
+        raise vol.Invalid("a multi-line program needs at least one action")
+    return head, conditions, actions
+
+
+def _at_slots(records: list[Program], first_slot: int) -> list[SlotChange]:
+    return [
+        SlotChange(
+            first_slot + i,
+            Program.from_wire_bytes(r.encode_wire_bytes(), slot=first_slot + i),
+        )
+        for i, r in enumerate(records)
+    ]
+
+
+async def _run_block_command(
+    connection: websocket_api.ActiveConnection, msg: dict[str, Any], work: Any,
+) -> None:
+    """Run a block handler body, turning its failures into WS errors."""
+    try:
+        await work()
+    except ProgramChangeError as err:
+        connection.send_error(msg["id"], err.code, str(err))
+    except NotImplementedError as err:
+        connection.send_error(msg["id"], "not_supported", str(err))
+    except RuntimeError as err:
+        connection.send_error(msg["id"], "not_connected", str(err))
+
+
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "omni_pca/programs/chain/write",
@@ -559,6 +653,11 @@ _PROGRAM_FIELD_SCHEMA = vol.Schema(
         vol.Required("head"): dict,        # WHEN / AT / EVERY program dict
         vol.Required("conditions"): [dict],
         vol.Required("actions"): [dict],
+        # The records the editor loaded, in slot order, so a block that
+        # changed on the panel in the meantime is not overwritten.
+        vol.Optional("original"): [dict],
+        # Allow moving the block to free slots when it no longer fits.
+        vol.Optional("relocate", default=False): bool,
     }
 )
 @websocket_api.require_admin
@@ -568,24 +667,13 @@ async def _ws_chain_write(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Rewrite a clausal chain into consecutive slots.
+    """Rewrite a multi-line block (trigger + conditions + actions).
 
-    A clausal program spans one head (WHEN/AT/EVERY) + N condition
-    records (AND/OR) + M action records (THEN), each in its own slot.
-    Editing means rewriting the whole run.
-
-    Logic:
-      1. Find the *existing* chain that owns ``head_slot`` (so we know
-         which old slots to clear when the chain shrinks).
-      2. The new run spans slots [head_slot .. head_slot + new_len - 1].
-         If new_len > old_len, the additional slots must currently be
-         FREE — refuse otherwise so we never trample an adjacent
-         program.
-      3. Write each new record via ``download_program``. The new run's
-         records are emitted in slot order; THEN actions land last.
-      4. Clear any old chain slots beyond the new run's end (shrinking
-         case) so leftover continuation records don't get mis-associated
-         with the now-shorter chain.
+    The block occupies consecutive slots from ``head_slot``. If the new
+    version is longer and the slots after it are in use, the write is
+    refused with ``no_room`` unless ``relocate`` is set, in which case
+    the block moves to the first free slots after everything in use.
+    A shorter version frees the slots it no longer needs.
     """
     if _refuse_write(connection, msg, enabled=PROGRAM_CHAIN_WRITES_ENABLED):
         return
@@ -593,89 +681,171 @@ async def _ws_chain_write(
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
         return
-
-    # Validate every member dict against the per-record schema (used
-    # individually so each member can have its own defaults).
     try:
-        head_fields = _PROGRAM_FIELD_SCHEMA(msg["head"])
-        condition_fields = [_PROGRAM_FIELD_SCHEMA(c) for c in msg["conditions"]]
-        action_fields = [_PROGRAM_FIELD_SCHEMA(a) for a in msg["actions"]]
+        head, conditions, actions = _block_records(msg)
+        original = [
+            Program(**_PROGRAM_FIELD_SCHEMA(o)) for o in msg.get("original", [])
+        ]
     except vol.Invalid as err:
-        connection.send_error(msg["id"], "invalid", f"bad chain member: {err}")
+        connection.send_error(msg["id"], "invalid", f"bad program: {err}")
         return
-
-    if not action_fields:
-        connection.send_error(
-            msg["id"], "invalid", "chain must have at least one THEN action",
-        )
-        return
-
     head_slot = msg["head_slot"]
-    new_len = 1 + len(condition_fields) + len(action_fields)
+    new_records = [head, *conditions, *actions]
 
-    # Find the existing chain (if any) so we know which old slots are
-    # currently part of this program. Without an existing chain we still
-    # allow writing — that's the "create chain at this empty slot" case.
-    programs = coordinator.data.programs if coordinator.data else {}
-    existing = next(
-        (c for c in build_chains(tuple(programs.values()))
-         if c.head.slot == head_slot),
-        None,
-    )
-    existing_slots: set[int] = set()
-    if existing is not None:
-        for m in (existing.head, *existing.conditions, *existing.actions):
-            if m.slot is not None:
-                existing_slots.add(m.slot)
-
-    new_slot_range = range(head_slot, head_slot + new_len)
-    if new_slot_range.stop > 1501:
-        connection.send_error(
-            msg["id"], "invalid",
-            f"chain of {new_len} records starting at slot {head_slot} "
-            f"would extend past slot 1500",
-        )
-        return
-
-    # Anti-trample check for any expansion slots that aren't already
-    # part of this chain.
-    for s in new_slot_range:
-        if s in existing_slots:
-            continue
-        if s in programs and not programs[s].is_empty():
-            connection.send_error(
-                msg["id"], "invalid",
-                f"target slot {s} is occupied by another program "
-                f"(slot {s}); free it first",
+    async def work() -> None:
+        existing = await _read_block(hass, coordinator, head_slot)
+        if not existing:
+            raise ProgramChangeError(
+                "not_found", f"no multi-line program starts at slot {head_slot}",
             )
-            return
+        if "original" in msg and [r.encode_wire_bytes() for r in existing] != [
+            r.encode_wire_bytes() for r in original
+        ]:
+            raise ProgramChangeError(
+                "conflict",
+                "this program changed on the panel since it was loaded; "
+                "reload and try again",
+            )
+        old_slots = [r.slot for r in existing]
+        changes_api = async_get_program_changes(hass, coordinator)
 
-    # Build the typed records.
-    head = Program(slot=head_slot, **head_fields)
-    new_records: list[tuple[int, Program]] = [(head_slot, head)]
-    for i, cf in enumerate(condition_fields):
-        slot = head_slot + 1 + i
-        new_records.append((slot, Program(slot=slot, **cf)))
-    actions_base = head_slot + 1 + len(condition_fields)
-    for i, af in enumerate(action_fields):
-        slot = actions_base + i
-        new_records.append((slot, Program(slot=slot, **af)))
+        target = head_slot
+        blocked: int | None = None
+        for slot in range(head_slot + len(existing), head_slot + len(new_records)):
+            if slot > 1500 or await changes_api.async_read(slot) is not None:
+                blocked = slot
+                break
+        if blocked is not None:
+            free = await _first_free_run(hass, coordinator, len(new_records))
+            if not msg["relocate"] or free is None:
+                where = (
+                    f" It can be moved to slots {free}-{free + len(new_records) - 1}."
+                    if free is not None else " There is no free run of slots for it."
+                )
+                raise ProgramChangeError(
+                    "no_room",
+                    f"this program now needs {len(new_records)} slots but slot "
+                    f"{blocked} is in use.{where}",
+                )
+            target = free
 
-    # One journalled change: the new records in slot order, then any old
-    # chain slot beyond the new run's end (shrinking case). Clears come
-    # after writes so a transient observer never sees a half-rewritten
-    # chain.
-    to_clear = existing_slots - set(new_slot_range)
-    changes = [SlotChange(slot, prog) for slot, prog in new_records]
-    changes += [SlotChange(slot, None) for slot in sorted(to_clear)]
-    if await _apply_change(hass, connection, msg, coordinator, "edit_chain", changes) is None:
+        changes = _at_slots(new_records, target)
+        new_slots = {c.slot for c in changes}
+        changes += [SlotChange(s, None) for s in old_slots if s not in new_slots]
+        await changes_api.async_apply(
+            "edit_chain", changes, user_id=connection.user.id, block=True,
+            expect_before={
+                r.slot: {r.encode_wire_bytes()} for r in existing
+            },
+        )
+        connection.send_result(msg["id"], {
+            "head_slot": target,
+            "written_slots": sorted(new_slots),
+            "cleared_slots": sorted(s for s in old_slots if s not in new_slots),
+        })
+
+    await _run_block_command(connection, msg, work)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "omni_pca/programs/chain/clear",
+        vol.Required("entry_id"): str,
+        vol.Required("head_slot"): vol.All(int, vol.Range(min=1, max=1500)),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _ws_chain_clear(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Delete a whole multi-line block, every line of it."""
+    if _refuse_write(connection, msg, enabled=PROGRAM_CHAIN_WRITES_ENABLED):
         return
+    coordinator = _coordinator_for_entry(hass, msg["entry_id"])
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "panel not configured")
+        return
+    head_slot = msg["head_slot"]
 
-    connection.send_result(msg["id"], {
-        "head_slot": head_slot,
-        "written_slots": list(new_slot_range),
-        "cleared_slots": sorted(to_clear),
-    })
+    async def work() -> None:
+        existing = await _read_block(hass, coordinator, head_slot)
+        if not existing:
+            raise ProgramChangeError(
+                "not_found", f"no multi-line program starts at slot {head_slot}",
+            )
+        await async_get_program_changes(hass, coordinator).async_apply(
+            "clear_chain", [SlotChange(r.slot, None) for r in existing],
+            user_id=connection.user.id, block=True,
+        )
+        connection.send_result(msg["id"], {
+            "head_slot": head_slot,
+            "cleared_slots": [r.slot for r in existing],
+        })
+
+    await _run_block_command(connection, msg, work)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "omni_pca/programs/chain/clone",
+        vol.Required("entry_id"): str,
+        vol.Required("source_slot"): vol.All(int, vol.Range(min=1, max=1500)),
+        vol.Required("target_slot"): vol.All(int, vol.Range(min=1, max=1500)),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _ws_chain_clone(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Copy a whole multi-line block to free slots from ``target_slot``."""
+    if _refuse_write(connection, msg, enabled=PROGRAM_CHAIN_WRITES_ENABLED):
+        return
+    coordinator = _coordinator_for_entry(hass, msg["entry_id"])
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "panel not configured")
+        return
+    src = msg["source_slot"]
+    dst = msg["target_slot"]
+
+    async def work() -> None:
+        existing = await _read_block(hass, coordinator, src)
+        if not existing:
+            raise ProgramChangeError(
+                "not_found", f"no multi-line program starts at slot {src}",
+            )
+        last = dst + len(existing) - 1
+        programs = coordinator.data.programs if coordinator.data else {}
+        next_free = _next_free_slot(programs)
+        hint = f"; the next free slot is {next_free}" if next_free else ""
+        if last > 1500:
+            raise ProgramChangeError(
+                "invalid", f"slots {dst}-{last} run past slot 1500{hint}",
+            )
+        changes_api = async_get_program_changes(hass, coordinator)
+        for slot in range(dst, last + 1):
+            if await changes_api.async_read(slot) is not None:
+                raise ProgramChangeError(
+                    "invalid",
+                    f"this program needs slots {dst}-{last} but "
+                    f"{_occupant_description(programs, slot)}{hint}",
+                )
+        await changes_api.async_apply(
+            "clone_chain", _at_slots(existing, dst),
+            user_id=connection.user.id, block=True,
+            expect_before={s: {bytes(PROGRAM_BYTES)} for s in range(dst, last + 1)},
+        )
+        connection.send_result(msg["id"], {
+            "source_slot": src, "target_slot": dst,
+            "written_slots": list(range(dst, last + 1)),
+        })
+
+    await _run_block_command(connection, msg, work)
 
 
 @websocket_api.websocket_command(
@@ -1014,6 +1184,8 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, _ws_clone_program)
     websocket_api.async_register_command(hass, _ws_write_program)
     websocket_api.async_register_command(hass, _ws_chain_write)
+    websocket_api.async_register_command(hass, _ws_chain_clear)
+    websocket_api.async_register_command(hass, _ws_chain_clone)
     websocket_api.async_register_command(hass, _ws_list_objects)
     websocket_api.async_register_command(hass, _ws_program_history)
     websocket_api.async_register_command(hass, _ws_program_undo)
