@@ -268,6 +268,10 @@ async def _ws_list_programs(
             summary = renderer.summarize_chain(chain)
             rows.append({
                 "slot": slot,
+                "last_slot": max(
+                    m.slot for m in (chain.head, *chain.conditions, *chain.actions)
+                    if m.slot is not None
+                ),
                 "kind": "chain",
                 "trigger_type": _classify_trigger(chain.head),
                 "summary": _tokens_to_json(summary),
@@ -282,6 +286,7 @@ async def _ws_list_programs(
         summary = renderer.summarize_program(program)
         rows.append({
             "slot": slot,
+            "last_slot": slot,
             "kind": "compact",
             "trigger_type": _classify_trigger(program),
             "summary": _tokens_to_json(summary),
@@ -324,6 +329,8 @@ async def _ws_list_programs(
         "filtered_total": filtered_total,
         "offset": offset,
         "limit": limit,
+        # First slot after everything in use; None when the table is full.
+        "next_free_slot": _next_free_slot(programs),
         "can_write": PROGRAM_WRITES_ENABLED,
         "can_edit_chains": PROGRAM_WRITES_ENABLED and PROGRAM_CHAIN_WRITES_ENABLED,
         "can_fire": PROGRAM_WRITES_ENABLED and PROGRAM_FIRE_ENABLED,
@@ -413,6 +420,24 @@ async def _ws_get_program(
         # underlying integer values to round-trip cleanly.
         "fields": _program_to_fields(target),
     })
+
+
+def _next_free_slot(programs: dict[int, Program]) -> int | None:
+    slot = max(programs, default=0) + 1
+    return slot if slot <= 1500 else None
+
+
+def _occupant_description(programs: dict[int, Program], slot: int) -> str:
+    """Say what is in ``slot``, for a "slot is in use" refusal."""
+    for chain in build_chains(tuple(programs[s] for s in sorted(programs))):
+        members = [chain.head, *chain.conditions, *chain.actions]
+        slots = [m.slot for m in members if m.slot is not None]
+        if slot in slots and len(slots) > 1:
+            return (
+                f"slot {slot} is in use: it is line {slots.index(slot) + 1} of the "
+                f"multi-line program in slots {min(slots)}-{max(slots)}"
+            )
+    return f"slot {slot} is in use by another program"
 
 
 def _refuse_write(
@@ -854,10 +879,16 @@ async def _ws_clone_program(
         )
         return
     cloned = Program.from_wire_bytes(source_program.encode_wire_bytes(), slot=dst)
+    programs = coordinator.data.programs if coordinator.data else {}
+    next_free = _next_free_slot(programs)
+    hint = f"; the next free slot is {next_free}" if next_free else ""
     if await _apply_change(
         hass, connection, msg, coordinator, "clone", [SlotChange(dst, cloned)],
         expect_before={dst: {bytes(PROGRAM_BYTES)}},
-        conflict_message=f"target slot {dst} is not free",
+        conflict_message=(
+            f"target slot {dst} is not free ({_occupant_description(programs, dst)})"
+            f"{hint}"
+        ),
     ) is None:
         return
     connection.send_result(

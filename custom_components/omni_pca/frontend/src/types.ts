@@ -18,6 +18,8 @@ export interface Token {
 export interface ProgramRow {
   /** 1-based slot number. For chains, the head slot. */
   slot: number;
+  /** Last slot the program occupies (same as ``slot`` for one line). */
+  last_slot?: number;
   /** "compact" or "chain". */
   kind: string;
   /** TIMED / EVENT / YEARLY / WHEN / AT / EVERY / REMARK / FREE. */
@@ -36,6 +38,8 @@ export interface ProgramListResponse {
   filtered_total: number;
   offset: number;
   limit: number;
+  /** First slot after everything in use; null when the table is full. */
+  next_free_slot?: number | null;
   /** Edit / clone / clear of single-line programs, and undo. */
   can_write?: boolean;
   /** Editing multi-line WHEN / AT / EVERY blocks. */
@@ -821,4 +825,17 @@ export interface Hass {
     entries?: Record<string, unknown>;
   };
   // Whole hass is much larger; we only touch what we need.
+}
+
+
+/** Text for a failed websocket call. Home Assistant rejects with a plain
+ *  ``{code, message}`` object rather than an Error. */
+export function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const e = err as { message?: unknown; code?: unknown };
+    if (typeof e.message === "string" && e.message) return e.message;
+    if (typeof e.code === "string" && e.code) return e.code;
+  }
+  return String(err);
 }

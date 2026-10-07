@@ -153,6 +153,43 @@ async def test_clone_refuses_an_occupied_target(
     assert mock.state.programs == before
 
 
+@pytest.fixture
+def block_on_panel(panel) -> None:
+    """Seed WHEN zone 1 not ready / THEN unit 2 on / THEN unit 1 off in
+    slots 30-32. Request it before ``configured_panel`` so the
+    integration discovers it at setup."""
+    programs = panel[0].state.programs
+    programs[30] = bytes.fromhex("05 00 00 00 00 00 00 00 00 06 01 00 00 00")
+    programs[31] = bytes.fromhex("0a 00 00 00 00 01 00 00 02 00 00 00 00 00")
+    programs[32] = bytes.fromhex("0a 00 00 00 00 00 00 00 01 00 00 00 00 00")
+
+
+async def test_clone_into_a_block_says_what_is_there(
+    hass: HomeAssistant, panel, block_on_panel, configured_panel, hass_ws_client
+) -> None:
+    """A slot inside a multi-line program looks empty in the list, which
+    shows one row per program; the refusal has to explain itself."""
+    mock = panel[0]
+    entry = configured_panel
+    before = dict(mock.state.programs)
+
+    listing = await _call(hass, hass_ws_client, entry, {"type": "omni_pca/programs/list"})
+    rows = {r["slot"]: r for r in listing["result"]["programs"]}
+    assert rows[30]["last_slot"] == 32
+    assert rows[12]["last_slot"] == 12
+    assert 31 not in rows
+    assert listing["result"]["next_free_slot"] == 100
+
+    response = await _call(hass, hass_ws_client, entry, {
+        "type": "omni_pca/programs/clone", "source_slot": 12, "target_slot": 31,
+    })
+    assert response["error"]["code"] == "invalid"
+    message = response["error"]["message"]
+    assert "line 2 of the multi-line program in slots 30-32" in message
+    assert "next free slot is 100" in message
+    assert mock.state.programs == before
+
+
 async def test_clear_of_an_empty_slot_is_reported(
     hass: HomeAssistant, configured_panel, hass_ws_client
 ) -> None:

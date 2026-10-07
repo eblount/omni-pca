@@ -58,6 +58,7 @@ import {
   encodeDuration,
   encodeEventId,
   encodeStructuredAnd,
+  errorText,
   eventIdFromFields,
   fToRawTemp,
   isEditableStructuredAnd,
@@ -108,6 +109,7 @@ export class OmniPanelPrograms extends LitElement {
   @state() private _canWrite = false;
   @state() private _canEditChains = false;
   @state() private _canFire = false;
+  @state() private _nextFreeSlot: number | null = null;
   // Change journal (undo), loaded when the History view is opened.
   @state() private _showHistory = false;
   @state() private _history: JournalEntry[] | null = null;
@@ -221,7 +223,7 @@ export class OmniPanelPrograms extends LitElement {
       void this._loadList();
       this._startRefreshTimer();
     } catch (err) {
-      this._error = `Could not discover panels: ${err instanceof Error ? err.message : String(err)}`;
+      this._error = `Could not discover panels: ${errorText(err)}`;
     }
   }
 
@@ -252,8 +254,9 @@ export class OmniPanelPrograms extends LitElement {
       this._canWrite = result.can_write === true;
       this._canEditChains = result.can_edit_chains === true;
       this._canFire = result.can_fire === true;
+      this._nextFreeSlot = result.next_free_slot ?? null;
     } catch (err) {
-      this._error = err instanceof Error ? err.message : String(err);
+      this._error = errorText(err);
     } finally {
       this._loading = false;
     }
@@ -270,7 +273,7 @@ export class OmniPanelPrograms extends LitElement {
         slot,
       });
     } catch (err) {
-      this._error = err instanceof Error ? err.message : String(err);
+      this._error = errorText(err);
     } finally {
       this._detailLoading = false;
     }
@@ -288,7 +291,7 @@ export class OmniPanelPrograms extends LitElement {
       this._fireFeedback = `fired slot ${slot}`;
       // Live-state will refresh on the next poll tick.
     } catch (err) {
-      this._fireFeedback = `error: ${err instanceof Error ? err.message : err}`;
+      this._fireFeedback = `error: ${errorText(err)}`;
     }
     // Auto-clear feedback after a beat.
     setTimeout(() => { this._fireFeedback = null; }, 4000);
@@ -310,8 +313,10 @@ export class OmniPanelPrograms extends LitElement {
       this._detail = null;
       await this._loadList();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorText(err);
       this._writeFeedback = `error: ${message}`;
+      setTimeout(() => { this._writeFeedback = null; }, 15000);
+      return;
     }
     setTimeout(() => { this._writeFeedback = null; }, 4000);
   }
@@ -346,8 +351,10 @@ export class OmniPanelPrograms extends LitElement {
       await this._loadList();
       await this._loadDetail(target);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = errorText(err);
       this._writeFeedback = `error: ${message}`;
+      setTimeout(() => { this._writeFeedback = null; }, 15000);
+      return;
     }
     setTimeout(() => { this._writeFeedback = null; }, 4000);
   }
@@ -367,7 +374,7 @@ export class OmniPanelPrograms extends LitElement {
       });
     } catch (err) {
       // Picker dropdowns will fall back to "Slot N" labels — not fatal.
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = errorText(err);
       console.warn("omni_pca: objects/list failed", msg);
     }
   }
@@ -435,8 +442,10 @@ export class OmniPanelPrograms extends LitElement {
       await this._loadList();
       await this._loadDetail(headSlot);
     } catch (err) {
-      const m = err instanceof Error ? err.message : String(err);
+      const m = errorText(err);
       this._writeFeedback = `error: ${m}`;
+      setTimeout(() => { this._writeFeedback = null; }, 15000);
+      return;
     }
     setTimeout(() => { this._writeFeedback = null; }, 4000);
   }
@@ -550,8 +559,10 @@ export class OmniPanelPrograms extends LitElement {
       await this._loadList();
       await this._loadDetail(this._detail.slot);
     } catch (err) {
-      const m = err instanceof Error ? err.message : String(err);
+      const m = errorText(err);
       this._writeFeedback = `error: ${m}`;
+      setTimeout(() => { this._writeFeedback = null; }, 15000);
+      return;
     }
     setTimeout(() => { this._writeFeedback = null; }, 4000);
   }
@@ -789,7 +800,7 @@ export class OmniPanelPrograms extends LitElement {
       >({ type: "omni_pca/programs/history", entry_id: this._entryId });
       this._history = result.entries;
     } catch (err) {
-      this._historyFeedback = err instanceof Error ? err.message : String(err);
+      this._historyFeedback = errorText(err);
     }
   }
 
@@ -806,7 +817,7 @@ export class OmniPanelPrograms extends LitElement {
       await this._loadList();
       if (this._selectedSlot !== null) await this._loadDetail(this._selectedSlot);
     } catch (err) {
-      const m = (err as { message?: string })?.message ?? String(err);
+      const m = errorText(err);
       this._historyFeedback = `could not undo: ${m}`;
     }
     await this._loadHistory();
@@ -978,7 +989,9 @@ export class OmniPanelPrograms extends LitElement {
             class="row ${this._selectedSlot === row.slot ? "selected" : ""}"
             @click=${() => this._onRowClick(row.slot)}
           >
-            <div class="row-slot">#${row.slot}</div>
+            <div class="row-slot">${
+              row.last_slot && row.last_slot !== row.slot
+                ? `#${row.slot}–${row.last_slot}` : `#${row.slot}`}</div>
             <div class="row-summary">
               ${renderTokens(row.summary, (k, i) => this._onRefClick(k, i))}
             </div>
@@ -1047,6 +1060,11 @@ export class OmniPanelPrograms extends LitElement {
             @click=${() => {
               this._showCloneInput = !this._showCloneInput;
               this._confirmingClear = false;
+              // Offer the first slot after everything in use; slots
+              // inside a multi-line program are not free.
+              if (this._showCloneInput && this._nextFreeSlot !== null) {
+                this._cloneTargetSlot = String(this._nextFreeSlot);
+              }
             }}
           >Clone…</button>
           <button
@@ -2829,7 +2847,10 @@ export class OmniPanelPrograms extends LitElement {
     }
     .detail footer {
       display: flex; align-items: center; gap: 12px; margin-top: 14px;
+      flex-wrap: wrap;
     }
+    /* Messages get their own line under the buttons. */
+    .detail footer .fire-feedback { flex-basis: 100%; }
     .fire, .primary, .secondary, .danger {
       border: none;
       padding: 8px 16px;
