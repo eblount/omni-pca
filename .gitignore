@@ -51,3 +51,4 @@ custom_components/omni_pca/frontend/node_modules/
 # Program table read from a real panel; used by tests/test_real_panel_programs.py
 # when present.
 tests/fixtures/omni_iie_programs.json
+custom_components/omni_pca/frontend/test/.types.bundle.mjs

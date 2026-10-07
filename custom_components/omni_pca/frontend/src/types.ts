@@ -36,8 +36,23 @@ export interface ProgramListResponse {
   filtered_total: number;
   offset: number;
   limit: number;
-  /** False while the integration is view-only: hide every action. */
+  /** Edit / clone / clear of single-line programs, and undo. */
   can_write?: boolean;
+  /** Editing multi-line WHEN / AT / EVERY blocks. */
+  can_edit_chains?: boolean;
+  /** The "Fire now" button. */
+  can_fire?: boolean;
+}
+
+/** One journalled change, as ``omni_pca/programs/history`` returns it. */
+export interface JournalEntry {
+  id: string;
+  time: string;
+  action: string;
+  status: "pending" | "applied" | "failed" | "undone";
+  changes: Array<{ slot: number; before: string | null; after: string | null }>;
+  undoes?: string;
+  error?: string;
 }
 
 export interface ProgramDetail {
@@ -125,30 +140,91 @@ export interface ObjectListResponse {
 // most useful subset of omni_pca.commands.Command. The second element
 // is what object kind (if any) the command's pr2 parameter references —
 // drives the object picker's filter.
+/** Which extra inputs a command's action form needs. */
+export type CommandForm =
+  | "unit"         // pr2 = unit, par = how long (0 = until changed)
+  | "level"        // pr2 = unit, par = level %
+  | "timed-level"  // pr2 = level << 8 | unit, par = how long
+  | "all"          // pr2 = area, 0 = every area
+  | "zone"         // pr2 = zone
+  | "button"       // pr2 = button
+  | "area"         // pr2 = area
+  | "link"         // pr2 = UPB link number
+  | "setpoint";    // pr2 = thermostat (0 = all), par = raw temperature
+
 export interface CommandOption {
   value: number;
   label: string;
+  form: CommandForm;
   ref_kind: "unit" | "zone" | "area" | "button" | null;
 }
 
 export const COMMAND_OPTIONS: CommandOption[] = [
-  { value: 0,  label: "Turn OFF unit",        ref_kind: "unit" },
-  { value: 1,  label: "Turn ON unit",         ref_kind: "unit" },
-  { value: 2,  label: "All OFF",              ref_kind: null },
-  { value: 3,  label: "All ON",               ref_kind: null },
-  { value: 4,  label: "Bypass zone",          ref_kind: "zone" },
-  { value: 5,  label: "Restore zone",         ref_kind: "zone" },
-  { value: 7,  label: "Execute button",       ref_kind: "button" },
-  { value: 9,  label: "Set unit level %",     ref_kind: "unit" },
-  { value: 48, label: "Disarm area",          ref_kind: "area" },
-  { value: 49, label: "Arm area Day",         ref_kind: "area" },
-  { value: 50, label: "Arm area Night",       ref_kind: "area" },
-  { value: 51, label: "Arm area Away",        ref_kind: "area" },
-  { value: 52, label: "Arm area Vacation",    ref_kind: "area" },
+  { value: 0,   label: "Turn OFF unit",        form: "unit",        ref_kind: "unit" },
+  { value: 1,   label: "Turn ON unit",         form: "unit",        ref_kind: "unit" },
+  { value: 9,   label: "Set unit level %",     form: "level",       ref_kind: "unit" },
+  { value: 101, label: "Set unit level % for a time", form: "timed-level", ref_kind: null },
+  { value: 2,   label: "All OFF",              form: "all",         ref_kind: null },
+  { value: 3,   label: "All ON",               form: "all",         ref_kind: null },
+  { value: 4,   label: "Bypass zone",          form: "zone",        ref_kind: "zone" },
+  { value: 5,   label: "Restore zone",         form: "zone",        ref_kind: "zone" },
+  { value: 7,   label: "Execute button",       form: "button",      ref_kind: "button" },
+  { value: 28,  label: "UPB link OFF",         form: "link",        ref_kind: null },
+  { value: 29,  label: "UPB link ON",          form: "link",        ref_kind: null },
+  { value: 66,  label: "Set heat setpoint",    form: "setpoint",    ref_kind: null },
+  { value: 67,  label: "Set cool setpoint",    form: "setpoint",    ref_kind: null },
+  { value: 48,  label: "Disarm area",          form: "area",        ref_kind: "area" },
+  { value: 49,  label: "Arm area Day",         form: "area",        ref_kind: "area" },
+  { value: 50,  label: "Arm area Night",       form: "area",        ref_kind: "area" },
+  { value: 51,  label: "Arm area Away",        form: "area",        ref_kind: "area" },
+  { value: 52,  label: "Arm area Vacation",    form: "area",        ref_kind: "area" },
 ];
 
 export function commandOptionFor(value: number): CommandOption | undefined {
   return COMMAND_OPTIONS.find((c) => c.value === value);
+}
+
+// A unit command's duration byte: 1-99 = seconds, 101-199 = 1-99
+// minutes, 201-218 = 1-18 hours, 0 = until changed. Anything else is
+// kept as "raw" so the editor never rewrites a value it can't explain.
+export type DurationUnit = "none" | "sec" | "min" | "hr" | "raw";
+
+export interface DecodedDuration {
+  unit: DurationUnit;
+  value: number;
+}
+
+export function decodeDuration(par: number): DecodedDuration {
+  if (par === 0) return { unit: "none", value: 0 };
+  if (par >= 1 && par <= 99) return { unit: "sec", value: par };
+  if (par >= 101 && par <= 199) return { unit: "min", value: par - 100 };
+  if (par >= 201 && par <= 218) return { unit: "hr", value: par - 200 };
+  return { unit: "raw", value: par };
+}
+
+export function encodeDuration(d: DecodedDuration): number {
+  const clamp = (v: number, max: number) => Math.min(Math.max(Math.round(v) || 1, 1), max);
+  switch (d.unit) {
+    case "none": return 0;
+    case "sec":  return clamp(d.value, 99);
+    case "min":  return 100 + clamp(d.value, 99);
+    case "hr":   return 200 + clamp(d.value, 18);
+    case "raw":  return d.value & 0xFF;
+  }
+}
+
+// Raw Omni temperature byte <-> whole degrees Fahrenheit, matching
+// omni_pca.models.omni_temp_to_fahrenheit.
+export function rawTempToF(raw: number): number {
+  return Math.floor(raw * 0.9 + 0.5) - 40;
+}
+
+export function fToRawTemp(f: number): number {
+  const guess = Math.round((f + 40) / 0.9);
+  for (const raw of [guess, guess - 1, guess + 1]) {
+    if (raw >= 0 && raw <= 255 && rawTempToF(raw) === f) return raw;
+  }
+  return Math.min(Math.max(guess, 0), 255);
 }
 
 // Days bitmask bits (matches omni_pca.programs.Days). Bit 0 is unused.
@@ -182,6 +258,8 @@ export type EventCategory =
   | "button"   // USER_MACRO_BUTTON   (evt & 0xFF00) == 0x0000
   | "zone"     // ZONE_STATE_CHANGE   (evt & 0xFC00) == 0x0400
   | "unit"     // UNIT_STATE_CHANGE   (evt & 0xFC00) == 0x0800
+  | "allunits" // ALL ON / ALL OFF     (evt & 0xFFE0) == 0x03E0
+  | "security" // security mode set    (evt & 0x8000) != 0
   | "fixed"    // hard-coded IDs (phone / AC power)
   | "raw";     // anything else — show numeric
 
@@ -195,6 +273,13 @@ export interface DecodedEvent {
   /** For "unit": 1..511 plus on bool */
   unit?: number;
   unitOn?: boolean;
+  /** For "allunits": on/off, and the area (0 = every area). */
+  allOn?: boolean;
+  /** For "allunits" and "security": area number, 0 = any. */
+  area?: number;
+  /** For "security": mode 0..6 and user code (0 = any). */
+  mode?: number;
+  code?: number;
   /** For "fixed": the literal event ID. */
   fixedId?: number;
   /** For "raw": the literal event ID we couldn't classify. */
@@ -239,6 +324,21 @@ export function decodeEventId(eventId: number): DecodedEvent {
       unitOn: (eventId & 0x0200) !== 0,
     };
   }
+  if ((eventId & 0xFFE0) === 0x03E0) {
+    return {
+      category: "allunits",
+      allOn: (eventId & 0x0010) !== 0,
+      area: eventId & 0x000F,
+    };
+  }
+  if ((eventId & 0x8000) !== 0 && ((eventId >> 12) & 0x07) <= 6) {
+    return {
+      category: "security",
+      mode: (eventId >> 12) & 0x07,
+      area: (eventId >> 8) & 0x0F,
+      code: eventId & 0xFF,
+    };
+  }
   return { category: "raw", raw: eventId };
 }
 
@@ -254,6 +354,11 @@ export function encodeEventId(ev: DecodedEvent): number {
       const unit = (ev.unit ?? 1) & 0x01FF;
       return 0x0800 | (ev.unitOn ? 0x0200 : 0) | unit;
     }
+    case "allunits":
+      return 0x03E0 | (ev.allOn ? 0x0010 : 0) | ((ev.area ?? 0) & 0x0F);
+    case "security":
+      return 0x8000 | (((ev.mode ?? 0) & 0x07) << 12)
+        | (((ev.area ?? 0) & 0x0F) << 8) | ((ev.code ?? 0) & 0xFF);
     case "fixed":
       return ev.fixedId ?? 768;
     case "raw":
@@ -318,7 +423,8 @@ export type CondFamily =
   | "zone"   // ZONE family — zone + secure/not-ready
   | "unit"   // CTRL family — unit + on/off
   | "time"   // TIME family — time-clock + enabled/disabled
-  | "sec";   // SEC family — area + security mode
+  | "sec"    // SEC family — area + security mode
+  | "raw";   // a value this editor can't rebuild exactly — kept as is
 
 export interface DecodedCondition {
   family: CondFamily;
@@ -330,6 +436,8 @@ export interface DecodedCondition {
   active?: boolean;
   /** SEC family security mode (0..7). */
   mode?: number;
+  /** The untouched u16 when family == "raw". */
+  raw?: number;
 }
 
 // MiscConditional enum (matches omni_pca.programs.MiscConditional).
@@ -366,6 +474,14 @@ export const SECURITY_MODE_NAMES: ReadonlyArray<{ value: number; label: string }
 ];
 
 export function decodeCondition(cond: number): DecodedCondition {
+  const decoded = decodeConditionLoose(cond);
+  // Some bits aren't modelled (e.g. the arming-transition flag of the
+  // SEC family). If re-encoding wouldn't give the same value back,
+  // show it as raw rather than as something subtly different.
+  return encodeCondition(decoded) === cond ? decoded : { family: "raw", raw: cond };
+}
+
+function decodeConditionLoose(cond: number): DecodedCondition {
   if (cond === 0) return { family: "none" };
   const family = (cond >> 8) & 0xFC;
   const active = (cond & 0x0200) !== 0;
@@ -413,6 +529,8 @@ export function encodeCondition(c: DecodedCondition): number {
       const mode = (c.mode ?? 0) & 0x07;
       return (mode << 12) | (area << 8);
     }
+    case "raw":
+      return (c.raw ?? 0) & 0xFFFF;
   }
 }
 
@@ -455,55 +573,23 @@ export interface ChainMember {
  *   0x0C = TIME disabled       0x0E = TIME enabled
  */
 export function decodeAndCondition(fields: ProgramFields): DecodedCondition {
-  const family = (fields.cond ?? 0) & 0xFF;
-  const instance = ((fields.cond2 ?? 0) >> 8) & 0xFF;
-  const familyMajor = family & 0xFC;
-  const selector = (family & 0x02) !== 0;
-  if (family === 0 && instance === 0) return { family: "none" };
-  if (familyMajor === 0x00) return { family: "misc", misc: family & 0x0F };
-  if (familyMajor === 0x04) return { family: "zone", index: instance, active: selector };
-  if (familyMajor === 0x08) return { family: "unit", index: instance, active: selector };
-  if (familyMajor === 0x0C) return { family: "time", index: instance, active: selector };
-  // SEC: high nibble of family = mode, low nibble = area.
-  return {
-    family: "sec",
-    index: family & 0x0F,
-    mode: (family >> 4) & 0x07,
-  };
+  // Read together, the family byte and the instance byte are the same
+  // u16 a compact-form cond carries, so decode it the same way. (On a
+  // real panel "AND IF dark" is family 0x00 with the misc code 3 in the
+  // instance byte, and bit 0 of the family byte is bit 8 of a unit
+  // number — both are lost if the two bytes are decoded separately.)
+  return decodeCondition(andConditionWord(fields));
 }
 
-/** Re-encode a DecodedCondition into the cond/cond2 fields of an
- *  AND/OR record. Returns a partial ProgramFields with cond + cond2
- *  set; the caller should merge with the rest of the record (cmd/par/
- *  etc. stay zero for Traditional AND records).
- */
+export function andConditionWord(fields: ProgramFields): number {
+  return (((fields.cond ?? 0) & 0xFF) << 8) | (((fields.cond2 ?? 0) >> 8) & 0xFF);
+}
+
 export function encodeAndCondition(c: DecodedCondition): {
   cond: number; cond2: number;
 } {
-  switch (c.family) {
-    case "none":
-      return { cond: 0, cond2: 0 };
-    case "misc":
-      return { cond: (c.misc ?? 0) & 0x0F, cond2: 0 };
-    case "zone": {
-      const family = 0x04 | (c.active ? 0x02 : 0);
-      return { cond: family, cond2: ((c.index ?? 0) & 0xFF) << 8 };
-    }
-    case "unit": {
-      const family = 0x08 | (c.active ? 0x02 : 0);
-      return { cond: family, cond2: ((c.index ?? 0) & 0xFF) << 8 };
-    }
-    case "time": {
-      const family = 0x0C | (c.active ? 0x02 : 0);
-      return { cond: family, cond2: ((c.index ?? 0) & 0xFF) << 8 };
-    }
-    case "sec": {
-      const area = (c.index ?? 1) & 0x0F;
-      const mode = (c.mode ?? 0) & 0x07;
-      const family = (mode << 4) | area;
-      return { cond: family, cond2: 0 };
-    }
-  }
+  const word = encodeCondition(c);
+  return { cond: (word >> 8) & 0xFF, cond2: (word & 0xFF) << 8 };
 }
 
 /** True if the AND/OR record's op byte indicates a Structured-OP
@@ -522,8 +608,9 @@ export function isStructuredAnd(fields: ProgramFields): boolean {
 export function emptyAndRecord(): ProgramFields {
   return {
     prog_type: PROGRAM_TYPE_AND,
-    cond: 0x01,    // family OTHER (0x00) + misc NEVER (0x01)
-    cond2: 0, cmd: 0, par: 0, pr2: 0,
+    cond: 0x00,      // family byte: OTHER
+    cond2: 0x0100,   // instance byte: misc NEVER (0x01)
+    cmd: 0, par: 0, pr2: 0,
     month: 0, day: 0, days: 0, hour: 0, minute: 0,
   };
 }

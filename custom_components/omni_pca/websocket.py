@@ -36,9 +36,18 @@ from .bundled.program_renderer import (
     StateResolver,
     Token,
 )
-from .bundled.programs import Program, ProgramType
-from .const import DOMAIN, LOGGER, PROGRAM_WRITES_ENABLED
-from .program_io import async_clear_program, async_write_program
+from .bundled.programs import PROGRAM_BYTES, Program, ProgramType
+from .const import (
+    DOMAIN,
+    PROGRAM_CHAIN_WRITES_ENABLED,
+    PROGRAM_FIRE_ENABLED,
+    PROGRAM_WRITES_ENABLED,
+)
+from .program_changes import (
+    ProgramChangeError,
+    SlotChange,
+    async_get_program_changes,
+)
 
 if TYPE_CHECKING:
     from .coordinator import OmniDataUpdateCoordinator
@@ -316,6 +325,8 @@ async def _ws_list_programs(
         "offset": offset,
         "limit": limit,
         "can_write": PROGRAM_WRITES_ENABLED,
+        "can_edit_chains": PROGRAM_WRITES_ENABLED and PROGRAM_CHAIN_WRITES_ENABLED,
+        "can_fire": PROGRAM_WRITES_ENABLED and PROGRAM_FIRE_ENABLED,
     })
 
 
@@ -405,15 +416,74 @@ async def _ws_get_program(
 
 
 def _refuse_write(
-    connection: websocket_api.ActiveConnection, msg: dict[str, Any],
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    *,
+    enabled: bool | None = None,
 ) -> bool:
-    """Send a ``read_only`` error and return True while writes are disabled."""
-    if PROGRAM_WRITES_ENABLED:
+    """Send a ``read_only`` error and return True if this write is disabled."""
+    if PROGRAM_WRITES_ENABLED and (enabled is None or enabled):
         return False
     connection.send_error(
-        msg["id"], "read_only", "program editing is not enabled in this release",
+        msg["id"], "read_only", "this kind of program change is not enabled",
     )
     return True
+
+
+# Compact programs: one record is the whole program.
+_SINGLE_LINE_TYPES: frozenset[int] = frozenset({
+    int(ProgramType.TIMED), int(ProgramType.EVENT), int(ProgramType.YEARLY),
+})
+
+# Returned by _read_slot when it has already sent an error.
+_FAILED: Any = object()
+
+
+async def _read_slot(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    coordinator: "OmniDataUpdateCoordinator",
+    slot: int,
+) -> Any:
+    """Read ``slot`` from the panel; sends the error and returns _FAILED."""
+    try:
+        return await async_get_program_changes(hass, coordinator).async_read(slot)
+    except NotImplementedError as err:
+        connection.send_error(msg["id"], "not_supported", str(err))
+    except RuntimeError as err:
+        connection.send_error(msg["id"], "not_connected", str(err))
+    except Exception as err:
+        connection.send_error(msg["id"], "read_failed", str(err))
+    return _FAILED
+
+
+async def _apply_change(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    coordinator: "OmniDataUpdateCoordinator",
+    action: str,
+    changes: list[SlotChange],
+    *,
+    expect_before: dict[int, set[bytes]] | None = None,
+    conflict_message: str | None = None,
+) -> dict[str, Any] | None:
+    """Apply a journalled change; on failure send the error and return None."""
+    try:
+        return await async_get_program_changes(hass, coordinator).async_apply(
+            action, changes, user_id=connection.user.id,
+            expect_before=expect_before,
+        )
+    except ProgramChangeError as err:
+        message = conflict_message if err.code == "conflict" and conflict_message else str(err)
+        connection.send_error(
+            msg["id"], "invalid" if conflict_message and err.code == "conflict" else err.code,
+            message,
+        )
+    except RuntimeError as err:
+        connection.send_error(msg["id"], "not_connected", str(err))
+    return None
 
 
 def _program_to_fields(program: Program) -> dict[str, Any]:
@@ -492,16 +562,11 @@ async def _ws_chain_write(
          case) so leftover continuation records don't get mis-associated
          with the now-shorter chain.
     """
-    if _refuse_write(connection, msg):
+    if _refuse_write(connection, msg, enabled=PROGRAM_CHAIN_WRITES_ENABLED):
         return
     coordinator = _coordinator_for_entry(hass, msg["entry_id"])
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
-        return
-    try:
-        client = coordinator.client
-    except RuntimeError as err:
-        connection.send_error(msg["id"], "not_connected", str(err))
         return
 
     # Validate every member dict against the per-record schema (used
@@ -571,35 +636,15 @@ async def _ws_chain_write(
         slot = actions_base + i
         new_records.append((slot, Program(slot=slot, **af)))
 
-    # Write them in order.
-    try:
-        for slot, prog in new_records:
-            await async_write_program(client, slot, prog)
-    except NotImplementedError as err:
-        connection.send_error(msg["id"], "not_supported", str(err))
-        return
-    except Exception as err:
-        connection.send_error(msg["id"], "write_failed", str(err))
-        return
-
-    # Clear any old chain slot that's not in the new range (shrinking
-    # case). Order matters: clears come *after* writes so a transient
-    # observer never sees a half-rewritten chain.
+    # One journalled change: the new records in slot order, then any old
+    # chain slot beyond the new run's end (shrinking case). Clears come
+    # after writes so a transient observer never sees a half-rewritten
+    # chain.
     to_clear = existing_slots - set(new_slot_range)
-    for slot in sorted(to_clear):
-        try:
-            await async_clear_program(client, slot)
-        except Exception:
-            # Don't fail the whole write for a clear-failure; log and continue.
-            LOGGER.warning("failed to clear shrunk-away slot %s", slot)
-
-    # Update coordinator state. Same shape as single-slot write: drop
-    # cleared slots, set written slots.
-    if coordinator.data is not None:
-        for slot, prog in new_records:
-            coordinator.data.programs[slot] = prog
-        for slot in to_clear:
-            coordinator.data.programs.pop(slot, None)
+    changes = [SlotChange(slot, prog) for slot, prog in new_records]
+    changes += [SlotChange(slot, None) for slot in sorted(to_clear)]
+    if await _apply_change(hass, connection, msg, coordinator, "edit_chain", changes) is None:
+        return
 
     connection.send_result(msg["id"], {
         "head_slot": head_slot,
@@ -659,6 +704,9 @@ async def _ws_list_objects(
         vol.Required("entry_id"): str,
         vol.Required("slot"): vol.All(int, vol.Range(min=1, max=1500)),
         vol.Required("program"): dict,
+        # The fields the editor loaded, so a slot that changed on the
+        # panel in the meantime is not silently overwritten.
+        vol.Optional("original"): dict,
     }
 )
 @websocket_api.require_admin
@@ -668,17 +716,13 @@ async def _ws_write_program(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Write an arbitrary Program record to ``slot``.
+    """Write a single-line (TIMED / EVENT / YEARLY) program to ``slot``.
 
     The ``program`` payload is a JSON-friendly dict mirroring the
-    bundled :class:`Program` dataclass — every field passed
-    by name. Default 0 for fields the caller omits (matches the
-    dataclass defaults). ``remark_id`` is optional / None.
-
-    Frontend's edit form posts the whole struct on save; the slot is
-    re-stamped to ``msg["slot"]`` in case the caller forgot. Saves
-    update ``coordinator.data.programs[slot]`` immediately so the
-    next list call shows the edit before the next poll catches up.
+    bundled :class:`Program` dataclass — every field passed by name,
+    default 0 for fields the caller omits. The slot must be free or
+    already hold a single-line program; multi-line blocks are edited
+    through ``programs/chain/write``.
     """
     if _refuse_write(connection, msg):
         return
@@ -686,31 +730,40 @@ async def _ws_write_program(
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
         return
+    slot = msg["slot"]
     try:
         validated = _PROGRAM_FIELD_SCHEMA(msg["program"])
+        original = (
+            _PROGRAM_FIELD_SCHEMA(msg["original"]) if "original" in msg else None
+        )
     except vol.Invalid as err:
         connection.send_error(msg["id"], "invalid", f"bad program payload: {err}")
         return
-    try:
-        client = coordinator.client
-    except RuntimeError as err:
-        connection.send_error(msg["id"], "not_connected", str(err))
+    program = Program(slot=slot, **validated)
+    if program.prog_type not in _SINGLE_LINE_TYPES:
+        connection.send_error(
+            msg["id"], "invalid",
+            "only single-line (timed / event / yearly) programs can be written here",
+        )
         return
-
-    program = Program(slot=msg["slot"], **validated)
-    try:
-        await async_write_program(client, msg["slot"], program)
-    except NotImplementedError as err:
-        connection.send_error(msg["id"], "not_supported", str(err))
+    current = await _read_slot(hass, connection, msg, coordinator, slot)
+    if current is _FAILED:
         return
-    except Exception as err:
-        connection.send_error(msg["id"], "write_failed", str(err))
+    if current is not None and current.prog_type not in _SINGLE_LINE_TYPES:
+        connection.send_error(
+            msg["id"], "invalid",
+            f"slot {slot} is part of a multi-line program",
+        )
         return
-    if coordinator.data is not None:
-        coordinator.data.programs[msg["slot"]] = program
-    connection.send_result(
-        msg["id"], {"slot": msg["slot"], "written": True},
-    )
+    expect = None
+    if original is not None:
+        expect = {slot: {Program(slot=slot, **original).encode_wire_bytes()}}
+    if await _apply_change(
+        hass, connection, msg, coordinator, "edit",
+        [SlotChange(slot, program)], expect_before=expect,
+    ) is None:
+        return
+    connection.send_result(msg["id"], {"slot": slot, "written": True})
 
 
 @websocket_api.websocket_command(
@@ -727,11 +780,10 @@ async def _ws_clear_program(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Erase a program slot by writing an all-zero 14-byte body.
+    """Delete the single-line program in ``slot``.
 
-    Equivalent to "delete this program". v1 panels report
-    ``not_supported`` because their wire protocol only allows bulk
-    rewrites (which would clear everything).
+    Refused for a record of a multi-line block: freeing one slot of a
+    block would leave its other lines behind.
     """
     if _refuse_write(connection, msg):
         return
@@ -739,24 +791,24 @@ async def _ws_clear_program(
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
         return
-    try:
-        client = coordinator.client
-    except RuntimeError as err:
-        connection.send_error(msg["id"], "not_connected", str(err))
+    slot = msg["slot"]
+    current = await _read_slot(hass, connection, msg, coordinator, slot)
+    if current is _FAILED:
         return
-    try:
-        await async_clear_program(client, msg["slot"])
-    except NotImplementedError as err:
-        connection.send_error(msg["id"], "not_supported", str(err))
+    if current is None:
+        connection.send_error(msg["id"], "not_found", f"slot {slot} is already empty")
         return
-    except Exception as err:
-        connection.send_error(msg["id"], "clear_failed", str(err))
+    if current.prog_type not in _SINGLE_LINE_TYPES:
+        connection.send_error(
+            msg["id"], "invalid", f"slot {slot} is part of a multi-line program",
+        )
         return
-    # Drop the entry from the coordinator's in-memory view so subsequent
-    # ``list`` calls reflect the deletion before the next poll catches up.
-    if coordinator.data is not None:
-        coordinator.data.programs.pop(msg["slot"], None)
-    connection.send_result(msg["id"], {"slot": msg["slot"], "cleared": True})
+    if await _apply_change(
+        hass, connection, msg, coordinator, "clear", [SlotChange(slot, None)],
+        expect_before={slot: {current.encode_wire_bytes()}},
+    ) is None:
+        return
+    connection.send_result(msg["id"], {"slot": slot, "cleared": True})
 
 
 @websocket_api.websocket_command(
@@ -774,15 +826,7 @@ async def _ws_clone_program(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Copy ``source_slot``'s program into ``target_slot``.
-
-    Useful for "I want a slightly different version of this program" —
-    user clones into an empty slot, then (eventually, when the editor
-    UI lands) tweaks the fields and saves.
-
-    Refuses to clone when source and target are the same slot or when
-    the source slot is empty / not defined.
-    """
+    """Copy the single-line program in ``source_slot`` to a free slot."""
     if _refuse_write(connection, msg):
         return
     coordinator = _coordinator_for_entry(hass, msg["entry_id"])
@@ -796,48 +840,88 @@ async def _ws_clone_program(
             msg["id"], "invalid", "source and target slots must differ",
         )
         return
-    programs = coordinator.data.programs if coordinator.data else {}
-    source_program = programs.get(src)
-    if source_program is None or source_program.is_empty():
+    source_program = await _read_slot(hass, connection, msg, coordinator, src)
+    if source_program is _FAILED:
+        return
+    if source_program is None:
         connection.send_error(
             msg["id"], "not_found", f"no program at source slot {src}",
         )
         return
-    try:
-        client = coordinator.client
-    except RuntimeError as err:
-        connection.send_error(msg["id"], "not_connected", str(err))
+    if source_program.prog_type not in _SINGLE_LINE_TYPES:
+        connection.send_error(
+            msg["id"], "invalid", f"slot {src} is part of a multi-line program",
+        )
         return
-    # The Program dataclass carries the slot field; re-stamp it for the
-    # destination so the on-the-wire bytes are correctly addressed.
-    cloned = Program(
-        slot=dst,
-        prog_type=source_program.prog_type,
-        cond=source_program.cond,
-        cond2=source_program.cond2,
-        cmd=source_program.cmd,
-        par=source_program.par,
-        pr2=source_program.pr2,
-        month=source_program.month,
-        day=source_program.day,
-        days=source_program.days,
-        hour=source_program.hour,
-        minute=source_program.minute,
-        remark_id=source_program.remark_id,
-    )
-    try:
-        await async_write_program(client, dst, cloned)
-    except NotImplementedError as err:
-        connection.send_error(msg["id"], "not_supported", str(err))
+    cloned = Program.from_wire_bytes(source_program.encode_wire_bytes(), slot=dst)
+    if await _apply_change(
+        hass, connection, msg, coordinator, "clone", [SlotChange(dst, cloned)],
+        expect_before={dst: {bytes(PROGRAM_BYTES)}},
+        conflict_message=f"target slot {dst} is not free",
+    ) is None:
         return
-    except Exception as err:
-        connection.send_error(msg["id"], "clone_failed", str(err))
-        return
-    if coordinator.data is not None:
-        coordinator.data.programs[dst] = cloned
     connection.send_result(
         msg["id"], {"source_slot": src, "target_slot": dst, "cloned": True},
     )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "omni_pca/programs/history",
+        vol.Required("entry_id"): str,
+        vol.Optional("limit"): vol.All(int, vol.Range(min=1, max=200)),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _ws_program_history(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """The journal of changes made through this panel, newest first."""
+    coordinator = _coordinator_for_entry(hass, msg["entry_id"])
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "panel not configured")
+        return
+    changes = async_get_program_changes(hass, coordinator)
+    entries = await changes.async_history(msg.get("limit", 50))
+    connection.send_result(msg["id"], {"entries": entries})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "omni_pca/programs/undo",
+        vol.Required("entry_id"): str,
+        vol.Required("journal_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _ws_program_undo(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Put back what one journalled change replaced."""
+    if _refuse_write(connection, msg):
+        return
+    coordinator = _coordinator_for_entry(hass, msg["entry_id"])
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "panel not configured")
+        return
+    changes = async_get_program_changes(hass, coordinator)
+    try:
+        entry = await changes.async_undo(
+            msg["journal_id"], user_id=connection.user.id,
+        )
+    except ProgramChangeError as err:
+        connection.send_error(msg["id"], err.code, str(err))
+        return
+    except RuntimeError as err:
+        connection.send_error(msg["id"], "not_connected", str(err))
+        return
+    connection.send_result(msg["id"], {"entry": entry})
 
 
 @websocket_api.websocket_command(
@@ -860,6 +944,8 @@ async def _ws_fire_program(
     coordinator's :class:`OmniClient`. The panel acks; any state
     changes the program triggers come back as ordinary push events.
     """
+    if _refuse_write(connection, msg, enabled=PROGRAM_FIRE_ENABLED):
+        return
     coordinator = _coordinator_for_entry(hass, msg["entry_id"])
     if coordinator is None:
         connection.send_error(msg["id"], "not_found", "panel not configured")
@@ -898,6 +984,8 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, _ws_write_program)
     websocket_api.async_register_command(hass, _ws_chain_write)
     websocket_api.async_register_command(hass, _ws_list_objects)
+    websocket_api.async_register_command(hass, _ws_program_history)
+    websocket_api.async_register_command(hass, _ws_program_undo)
 
 
 # --------------------------------------------------------------------------

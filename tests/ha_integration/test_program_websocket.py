@@ -26,9 +26,12 @@ def _writes_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
     The disabled default is covered by ``test_program_view_only.py``.
     """
-    monkeypatch.setattr(
-        "custom_components.omni_pca.websocket.PROGRAM_WRITES_ENABLED", True
-    )
+    for switch in (
+        "PROGRAM_WRITES_ENABLED",
+        "PROGRAM_CHAIN_WRITES_ENABLED",
+        "PROGRAM_FIRE_ENABLED",
+    ):
+        monkeypatch.setattr(f"custom_components.omni_pca.websocket.{switch}", True)
 
 
 @pytest.fixture

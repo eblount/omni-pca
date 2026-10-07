@@ -51,9 +51,17 @@ EVENT_TASK_NAME: Final = "omni_pca-event-listener"
 # zones / units / areas, so we stop early when discovery returns EOD.
 MAX_OBJECT_INDEX: Final = 0xFFFF
 
-# Whether the Omni Programs panel may change the panel's programs. While
-# False every write command is refused and the panel shows no actions.
-PROGRAM_WRITES_ENABLED: Final = False
+# What the Omni Programs panel may do to the panel's programs. Each
+# switch was turned on only after that path was proven on a real panel.
+#
+# PROGRAM_WRITES_ENABLED is the master switch: edit, clone and clear of
+# single-line (timed / event / yearly) programs, plus undo.
+PROGRAM_WRITES_ENABLED: Final = True
+# Rewriting multi-line WHEN/AT/EVERY blocks, which moves records between
+# slots. Off until the block editor has been checked against real layouts.
+PROGRAM_CHAIN_WRITES_ENABLED: Final = False
+# "Fire now". Off: the command it sends has not been tried on a real panel.
+PROGRAM_FIRE_ENABLED: Final = False
 
 # Length, in characters, of a hex-encoded 16-byte controller key.
 CONTROLLER_KEY_HEX_LEN: Final = 32

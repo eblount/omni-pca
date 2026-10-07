@@ -47,6 +47,47 @@ async def async_iter_programs(client: Any) -> AsyncIterator[Program]:
         yield program_from_library_wire(lib_program)
 
 
+def _require_v2(client: Any) -> None:
+    if not isinstance(client, OmniClient):
+        raise NotImplementedError(
+            "this panel connection can't read or write a single program; "
+            "use a TCP (Omni-Link II) connection for editing"
+        )
+
+
+async def async_read_program(client: Any, slot: int) -> Program | None:
+    """Read one slot straight from the panel; ``None`` if it is free.
+
+    Asks for "the next defined program after ``slot - 1``", the same
+    request the full enumeration is built from, and checks the answer
+    is ``slot`` itself.
+    """
+    if not 1 <= slot <= MAX_PROGRAMS:
+        raise ValueError(f"program slot {slot} out of range 1..{MAX_PROGRAMS}")
+    _require_v2(client)
+    after = slot - 1
+    reply = await client._conn.request(  # noqa: SLF001 - no public single read
+        OmniLink2MessageType.UploadProgram,
+        bytes([(after >> 8) & 0xFF, after & 0xFF, 1]),
+    )
+    if reply.opcode == int(OmniLink2MessageType.EOD):
+        return None
+    if reply.opcode != int(OmniLink2MessageType.ProgramData):
+        raise OmniConnectionError(
+            f"unexpected opcode {reply.opcode} reading program slot {slot}"
+        )
+    if len(reply.payload) < 2 + PROGRAM_BYTES:
+        raise OmniConnectionError(
+            f"ProgramData payload too short ({len(reply.payload)} bytes)"
+        )
+    if ((reply.payload[0] << 8) | reply.payload[1]) != slot:
+        return None
+    program = Program.from_wire_bytes(
+        reply.payload[2 : 2 + PROGRAM_BYTES], slot=slot
+    )
+    return None if program.is_empty() else program
+
+
 async def async_write_program(client: Any, slot: int, program: Program) -> None:
     """Write ``program`` into ``slot`` (1-based) on the panel.
 
@@ -55,11 +96,7 @@ async def async_write_program(client: Any, slot: int, program: Program) -> None:
     """
     if not 1 <= slot <= MAX_PROGRAMS:
         raise ValueError(f"program slot {slot} out of range 1..{MAX_PROGRAMS}")
-    if not isinstance(client, OmniClient):
-        raise NotImplementedError(
-            "this panel connection can't write a single program; "
-            "use a TCP (Omni-Link II) connection for editing"
-        )
+    _require_v2(client)
     body = program.encode_wire_bytes()
     if len(body) != PROGRAM_BYTES:
         raise ValueError(

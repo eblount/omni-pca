@@ -35,9 +35,24 @@ The panel calls three websocket commands (all defined in
 * `omni_pca/programs/get`  — full structured-English detail for one slot.
 * `omni_pca/programs/fire` — sends `Command.EXECUTE_PROGRAM` over the wire.
 
-The list response carries `can_write`. While it is false (the integration's
-`PROGRAM_WRITES_ENABLED` constant) the panel is view-only: the detail pane
-shows no actions and the server refuses every write command.
+The list response says what is switched on (constants in `../const.py`):
+`can_write` (edit / clone / clear of single-line programs, and undo),
+`can_edit_chains` (multi-line blocks) and `can_fire` ("Fire now"). The panel
+hides what is off and the server refuses it with `read_only`.
+
+Every change goes through `../program_changes.py`: the slot is read from the
+panel first, the before and after bytes are journalled, the write is read
+back and verified, and `omni_pca/programs/history` / `omni_pca/programs/undo`
+expose the journal.
+
+## Tests
+
+```bash
+npm test    # every event / condition / duration value must round-trip
+```
+
+The editor must never change a field the user didn't touch, so anything it
+can't rebuild exactly is shown as "kept as is" rather than re-encoded.
 
 The frontend doesn't subscribe to push events; live-state badges
 refresh on a low-frequency poll (`REFRESH_MS = 5000`). That's a
